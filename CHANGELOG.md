@@ -62,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed: the Alternative Formats Menu
 
+- **Three formats left the menu.** HTML with math: Accessible HTML now
+  shows every document's math itself (MathJax for the LaTeX in Reflow-era
+  documents; browsers draw Iris's MathML, so those pages load nothing from
+  a CDN). Plain text: it threw away the headings, lists and tables every
+  other format keeps. Markdown: no student used it. Their URLs still
+  answer, for links people saved. The menu is now Accessible HTML and the
+  Immersive Reader, Audio and Translate, then Searchable PDF, ePub and
+  Braille.
 - **ePub downloads had an empty chapter.** ebooklib refused the chapter
   text (it began with an XML declaration naming an encoding) and wrote the
   chapter as an empty file, so every ePub was blank. The workaround meant to

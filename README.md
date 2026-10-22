@@ -82,9 +82,9 @@ endpoints the connector consumes.
 | Format | Tool | Notes |
 |---|---|---|
 | Accessible HTML | mistune + sanitize | Canonical source for every other format |
-| HTML with math | + MathJax (mhchem extension) | Iris writes MathML (with the LaTeX in `alttext`); legacy Reflow documents carry LaTeX, rendered at view time |
-| Plain text | tag-strip | UTF-8, no markup |
-| Markdown | markdownify | Derived from the canonical HTML; math as `$...$`, print pages as `[Page N]` |
+| HTML with math | + MathJax (mhchem extension) | Not in the menu: Accessible HTML loads MathJax itself when a (Reflow-era) document carries LaTeX, and browsers draw Iris's MathML. The URL still answers. |
+| Plain text | tag-strip | Not in the menu (it drops headings, lists and tables). The URL still answers, as a download. |
+| Markdown | markdownify | Not in the menu. The URL still answers, as a download: derived from the canonical HTML, math as `$...$`, print pages as `[Page N]`. |
 | Searchable PDF | Iris's tagged PDF (`equalify-iris-pdf`) | The original file, page for page, with a structure tree and a text layer built from Iris's HTML; scans included. A document Iris converted in parts is tagged part by part and joined. Made when faculty approve the document and kept on the connector's `connector-data` volume. When Iris cannot tag it, or faculty edited the document (Iris cannot see their edits): WeasyPrint (pdf/ua-1) renders the accessible HTML, or for an untouched scan ocrmypdf adds a text layer. |
 | ePub | ebooklib | EPUB3 |
 | Audio (MP3) | Amazon Polly | Requires `AWS_DEFAULT_REGION` + IAM credentials with `polly:SynthesizeSpeech`. Without them the menu shows it as under development. |

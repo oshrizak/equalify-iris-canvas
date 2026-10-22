@@ -116,6 +116,13 @@ _MATH_RE = re.compile(
 )
 
 
+def needs_mathjax(rendered: RenderedPage) -> bool:
+    """LaTeX or mhchem that only MathJax can draw (documents Reflow
+    converted). Iris writes MathML, which browsers draw themselves, so a
+    page of Iris math loads nothing from a CDN."""
+    return bool(_MATH_RE.search(rendered.html or ""))
+
+
 def has_math_content(rendered_or_text: RenderedPage | str) -> bool:
     """True when the source carries LaTeX math or mhchem chemistry markup.
 

@@ -241,3 +241,21 @@ def test_approving_an_edited_document_does_not_ask_iris_to_tag_it(
         assert resp.status_code == 200, resp.text
         time.sleep(0.3)
         assert route.call_count == 0
+
+
+# ---- Accessible HTML draws math -----------------------------------------------
+
+@pytest.mark.integration
+def test_accessible_html_loads_mathjax_only_for_latex(client, instructor_session, redis_client):
+    _plant(redis_client, instructor_session["course_id"])
+
+    async def body(html):
+        await put_iris_body(redis_client, "job-iris-1", html)
+
+    _run(body('<h1>T</h1><p>Area <math alttext="\\pi r^2"><mi>π</mi></math></p>'))
+    mathml = client.get("/canvas/panorama/alt/job-iris-1/html").text
+    assert "<math" in mathml and "mathjax" not in mathml.lower()
+
+    _run(body("<h1>T</h1><p>Area $$\\pi r^2$$</p>"))
+    latex = client.get("/canvas/panorama/alt/job-iris-1/html").text
+    assert "mathjax" in latex.lower()

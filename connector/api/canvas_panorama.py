@@ -25,6 +25,7 @@ from ..canvas.alt_formats import (
     audio_configured,
     html_full_document,
     html_to_plain_text,
+    needs_mathjax,
     pdf_has_text_layer,
     render_audio_mp3,
     render_braille_brf,
@@ -625,7 +626,9 @@ async def alt_format(
     rendered = await _resolve_html(redis, job_id)
 
     if fmt == "html":
-        return HTMLResponse(html_full_document(rendered, mathjax=False))
+        # The one HTML in the menu, so it shows every document's math:
+        # MathJax for LaTeX, the browser for Iris's MathML.
+        return HTMLResponse(html_full_document(rendered, mathjax=needs_mathjax(rendered)))
     if fmt == "html-math":
         return HTMLResponse(html_full_document(rendered, mathjax=True))
     if fmt == "txt":

@@ -10,7 +10,7 @@
  * Alternative Formats Menu modal. Instructors also get an "Edit
  * Accessible HTML" button that opens an in-modal editor with live
  * preview; saved edits become the canonical source for every other
- * format (ePub, audio, plain text, math, translations).
+ * format (ePub, braille, the reader, audio, translations).
  */
 (function () {
   "use strict";
@@ -61,7 +61,11 @@
   // The original source PDF lives in Canvas Files where faculty
   // uploaded it — surfacing it again in this menu was confusing
   // ("why does the accessible-formats menu offer me my original
-  // PDF?") so it's removed.
+  // PDF?") so it's removed. HTML with math, Plain text and Markdown
+  // left the menu too: Accessible HTML shows math itself, plain text
+  // throws away the headings, lists and tables the other formats keep,
+  // and Markdown served no student. Their URLs still answer, for links
+  // people saved.
   var FORMAT_GROUPS = [
     { id: "read",      label: "Read"             },
     { id: "listen",    label: "Listen & translate" },
@@ -69,12 +73,9 @@
   ];
   var FORMATS = [
     { id: "html",      group: "read",     label: "Accessible HTML",    icon: "🌐", color: "#0a5fb5", live: true },
-    { id: "html-math", group: "read",     label: "HTML with math",     icon: "∑",  color: "#5b3da6", live: true },
-    { id: "txt",       group: "read",     label: "Plain text",         icon: "🅣", color: "#2e7d32", live: true, download: true },
-    { id: "markdown",  group: "read",     label: "Markdown",           icon: "📝", color: "#1d1d1d", live: true, download: true },
+    { id: "immersive", group: "read",     label: "Immersive Reader",   icon: "👁", color: "#5b3da6", live: true },
     { id: "audio",     group: "listen",   label: "Audio (MP3)",        icon: "🎧", color: "#2e7d32", live: true, download: true },
     { id: "translate", group: "listen",   label: "Translate…",         icon: "🌐", color: "#2e7d32", live: true, picker: "language" },
-    { id: "immersive", group: "listen",   label: "Immersive Reader",   icon: "👁", color: "#5b3da6", live: true },
     { id: "ocr",       group: "document", label: "Searchable PDF",     icon: "🔎", color: "#cc7a00", live: true, download: true },
     { id: "epub",      group: "document", label: "ePub",               icon: "📚", color: "#0e7a8a", live: true, download: true },
     { id: "braille",   group: "document", label: "Braille (BRF)",      icon: "⠿", color: "#5b3da6", live: true, download: true }
@@ -681,7 +682,7 @@
   // raw text, and a failure replaced Canvas with an error page. This keeps
   // the person on the page, says what is being prepared (Searchable PDF can
   // take a minute the first time), and explains a failure in words.
-  var DOWNLOAD_EXT = { txt: "txt", markdown: "md", audio: "mp3", ocr: "pdf", epub: "epub", braille: "brf" };
+  var DOWNLOAD_EXT = { audio: "mp3", ocr: "pdf", epub: "epub", braille: "brf" };
 
   function _say(statusEl, text) {
     if (!statusEl) return;
