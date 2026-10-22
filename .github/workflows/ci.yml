@@ -49,4 +49,4 @@ jobs:
         continue-on-error: true
         run: |
           pip install pip-audit
-          pip-audit --strict
+          pip-audit --skip-editable   # the project itself is not on PyPI

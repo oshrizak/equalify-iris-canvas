@@ -360,6 +360,29 @@ async def get_course_optin(redis: Redis, course_id: str) -> dict[str, Any] | Non
 
 
 # ----------------------------------------------------------------------
+# Drop folder name per course
+#
+# The folder was "Reflow - Convert to Accessible" before the move to Iris.
+# A course that already has it keeps using it (the watcher reads both
+# names), and the review page names the folder the course actually has.
+# ----------------------------------------------------------------------
+
+LEGACY_DROP_FOLDER_NAMES = ("Reflow - Convert to Accessible",)
+DROP_FOLDER_NAME_KEY = tk("canvas:course:{course_id}:dropfolder-name")
+
+
+async def remember_drop_folder_name(redis: Redis, course_id: str, name: str) -> None:
+    await redis.set(DROP_FOLDER_NAME_KEY.format(course_id=course_id), name)
+
+
+async def get_drop_folder_name(redis: Redis, course_id: str) -> str | None:
+    raw = await redis.get(DROP_FOLDER_NAME_KEY.format(course_id=course_id))
+    if not raw:
+        return None
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
+# ----------------------------------------------------------------------
 # Content-hash index
 #
 # Faculty drop a *copy* of a PDF into the Reflow folder, so the converted

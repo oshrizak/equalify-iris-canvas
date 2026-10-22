@@ -59,6 +59,7 @@ from ..canvas.iris_jobs import (
 )
 from ..canvas.spend_cap import reserve_submission
 from ..canvas.state import (
+    LEGACY_DROP_FOLDER_NAMES,
     already_processed,
     get_job,
     get_job_for_hash,
@@ -68,6 +69,7 @@ from ..canvas.state import (
     put_file_alias,
     put_job,
     put_job_for_hash,
+    remember_drop_folder_name,
 )
 from ..canvas.tenant import tk
 from ..canvas.user_oauth import get_user_token
@@ -614,24 +616,28 @@ async def _discover_drop_folder_files(
     folder_name: str,
     redis: Redis | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Return convertible files sitting in the course's Reflow drop folder.
+    """Return convertible files sitting in the course's drop folder.
 
     The drop folder is the explicit, per-document opt-in: a faculty member
     copies a PDF into it to say "convert this one". It is scanned on every
     tick regardless of whether full-course scanning is enabled, so someone
-    can try Reflow on a single file without authorising a sweep of
+    can try Iris on a single file without authorising a sweep of
     everything they have ever uploaded.
 
     Matching is case-insensitive on the folder's leaf name so that
-    "Reflow - Convert to Accessible" and "reflow - convert to accessible"
-    both work — faculty retype these.
+    "Iris - Convert to Accessible" and "iris - convert to accessible"
+    both work — faculty retype these. The folder's name from before the
+    move to Iris is read too, so a course that already has
+    "Reflow - Convert to Accessible" keeps working and gets no second folder.
+    The name found is remembered for the review page to show.
 
-    Returns an empty dict when the folder doesn't exist. We do not create it
-    here; the watcher should not be mutating course structure on a poll.
+    Returns an empty dict when no such folder exists, and then creates the
+    configured one, at most once per retry window (see below).
     """
-    wanted = folder_name.strip().lower()
-    if not wanted:
+    configured = folder_name.strip()
+    if not configured:
         return {}
+    wanted = {configured.lower(), *(name.lower() for name in LEGACY_DROP_FOLDER_NAMES)}
     out: dict[str, dict[str, Any]] = {}
     try:
         folders = await canvas.list_course_folders(course_id)
@@ -641,10 +647,12 @@ async def _discover_drop_folder_files(
 
     found = False
     for folder in folders:
-        leaf = str(folder.get("name") or "").strip().lower()
-        if leaf != wanted:
+        leaf = str(folder.get("name") or "").strip()
+        if leaf.lower() not in wanted:
             continue
         found = True
+        if redis is not None:
+            await remember_drop_folder_name(redis, course_id, leaf)
         try:
             for f in await canvas.list_folder_files(str(folder.get("id"))):
                 fid = str(f.get("id") or "")
@@ -666,11 +674,12 @@ async def _discover_drop_folder_files(
             course_id=course_id
         )
         if await redis.set(guard, "1", ex=_DROP_FOLDER_RETRY_SECONDS, nx=True):
-            created = await canvas.create_course_folder(course_id, folder_name)
+            created = await canvas.create_course_folder(course_id, configured)
             if created:
+                await remember_drop_folder_name(redis, course_id, configured)
                 logger.info(
-                    "created Reflow drop folder %r in course %s",
-                    folder_name, course_id,
+                    "created drop folder %r in course %s",
+                    configured, course_id,
                 )
     return out
 

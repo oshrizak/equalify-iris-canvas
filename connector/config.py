@@ -330,11 +330,12 @@ class Settings(BaseSettings):
         ),
     )
     canvas_drop_folder_name: str = Field(
-        default="Reflow - Convert to Accessible",
+        default="Iris - Convert to Accessible",
         description=(
             "Course Files folder that faculty copy PDFs into to request "
             "conversion. Created on demand. Kept ASCII — Canvas folder names "
-            "appear in URLs."
+            "appear in URLs. A course that already has the folder under its "
+            "earlier name, 'Reflow - Convert to Accessible', keeps using it."
         ),
     )
 

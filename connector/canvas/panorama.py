@@ -205,7 +205,7 @@ def issues_from_reflow_result(result: dict[str, Any]) -> list[Issue]:
                 page=None,
                 explanation=(
                     "Screen readers cannot read this document because it does not "
-                    "contain a text layer. Reflow recovered the text via OCR, but "
+                    "contain a text layer. The text was recovered from images of the pages, but "
                     "the original PDF should be re-exported from the source."
                 ),
                 fix_hint=(
@@ -244,7 +244,7 @@ def issues_from_reflow_result(result: dict[str, Any]) -> list[Issue]:
                 page=None,
                 explanation=(
                     "Images without alternative text are invisible to screen readers. "
-                    "Reflow proposed alt text where possible — review and edit it."
+                    "Alt text was proposed where possible; review and edit it."
                 ),
                 fix_hint=(
                     "Open the accessible HTML version, edit the alt text for each "

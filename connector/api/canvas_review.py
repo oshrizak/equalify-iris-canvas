@@ -25,6 +25,7 @@ from redis.asyncio import Redis
 from ..canvas.state import (
     get_consent,
     get_course_optin,
+    get_drop_folder_name,
     get_job,
     is_course_enabled,
     list_course_jobs,
@@ -210,7 +211,7 @@ _DISPLAY_ORDER: dict[str, int] = {
 # person deciding what to do about a document.
 _REASON: dict[str, str] = {
     "page_failed": (
-        "Converted successfully, but Reflow could not write the Canvas page. "
+        "Converted successfully, but the Canvas page could not be written. "
         "The page may be locked or in a locked module."
     ),
     "rejected": "You declined this document. It was not published.",
@@ -224,7 +225,7 @@ async def api_files(
     redis: Redis = Depends(get_redis_client),
     reflow_lti_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ) -> JSONResponse:
-    """Every document Reflow knows about in this course, with its state.
+    """Every document the connector knows about in this course, with its state.
 
     ``/api/pending`` answers "what needs a decision"; this answers "where
     is everything", which is the question the review screen is actually
@@ -575,7 +576,7 @@ async def approve(
             publish_warning = (
                 "The accessible alt formats are now available to students "
                 "through the LTI tool, but Canvas refused the Page publish. "
-                "Re-run Authorize Reflow (Settings → Apps) so the OAuth "
+                "Re-run Authorize Iris (Settings → Apps) so the OAuth "
                 "token has page-write scope, then the bridge will publish "
                 "the Page automatically on its next tick."
             )
@@ -729,12 +730,15 @@ async def api_optin_status(
     target_course = _course_for(session, course_id)
     enabled = await is_course_enabled(redis, target_course)
     record = await get_course_optin(redis, target_course)
+    drop_folder = await get_drop_folder_name(redis, target_course) or str(
+        getattr(settings, "canvas_drop_folder_name", "") or ""
+    )
     return JSONResponse(
         {
             "course_id": target_course,
             "enabled": enabled,
             "required": bool(getattr(settings, "canvas_require_course_optin", True)),
-            "drop_folder": str(getattr(settings, "canvas_drop_folder_name", "") or ""),
+            "drop_folder": drop_folder,
             "enabled_by": (record or {}).get("actor") or "",
             "enabled_at": (record or {}).get("at") or 0,
             "can_change": _is_instructor(session),

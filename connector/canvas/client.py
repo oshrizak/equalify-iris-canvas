@@ -33,8 +33,11 @@ the refresh is surfaced to the caller as a permission problem.
 
 from __future__ import annotations
 
+import asyncio
+import email.utils
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -57,6 +60,31 @@ _RETRY_MAX_DELAY = 30.0
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30.0
+
+# Canvas's file storage can answer "slow down" (429, or 503) to the upload
+# itself. Each try starts the upload over, because a refused upload URL is
+# not guaranteed to work a second time. Retry-After is honored up to a cap so
+# one figure cannot hold the bridge for long; the bridge retries the figure
+# again later if these tries run out.
+_STORE_ATTEMPTS = 3
+_STORE_THROTTLED = frozenset({429, 503})
+_STORE_WAIT_CAP_SECONDS = 30.0
+
+
+def _retry_after_seconds(resp: httpx.Response, default: float) -> float:
+    """How long to wait before trying again: Retry-After if usable, else ``default``."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    wait = default
+    if raw:
+        try:
+            wait = float(raw)
+        except ValueError:
+            try:
+                when = email.utils.parsedate_to_datetime(raw)
+                wait = (when - datetime.now(when.tzinfo or UTC)).total_seconds()
+            except (TypeError, ValueError):
+                wait = default
+    return max(1.0, min(wait, _STORE_WAIT_CAP_SECONDS))
 
 
 class CanvasClient:
@@ -446,7 +474,7 @@ class CanvasClient:
            final file object.
 
         ``folder_path`` is a course-relative folder (created if missing),
-        e.g. ``"Reflow Generated Images"``. Returns the Canvas file object,
+        e.g. ``"Iris Generated Images"``. Returns the Canvas file object,
         which includes ``id`` and ``url`` (a directly-embeddable link).
         """
         init_url = f"{self.base_url}/api/v1/courses/{course_id}/files"
@@ -463,22 +491,40 @@ class CanvasClient:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 return await client.post(init_url, headers=headers, json=init_payload)
 
-        init_resp = await self._request_with_401_retry(_init, "init file upload")
-        self._raise_for_status(init_resp, "init file upload")
-        init = init_resp.json()
-        upload_url = init.get("upload_url")
-        upload_params = init.get("upload_params") or {}
-        if not upload_url:
-            raise CanvasApiError(502, "Canvas file upload: no upload_url returned")
-
-        # Step 2: post to the storage target. No auth header — upload_params
-        # carry the signed credentials. Don't auto-follow the redirect so we
-        # can finalize it ourselves with our bearer.
         files = {"file": (filename, content, content_type)}
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            store_resp = await client.post(
-                upload_url, data=upload_params, files=files, follow_redirects=False
+        for attempt in range(1, _STORE_ATTEMPTS + 1):
+            init_resp = await self._request_with_401_retry(_init, "init file upload")
+            self._raise_for_status(init_resp, "init file upload")
+            init = init_resp.json()
+            upload_url = init.get("upload_url")
+            upload_params = init.get("upload_params") or {}
+            if not upload_url:
+                raise CanvasApiError(502, "Canvas file upload: no upload_url returned")
+
+            # Step 2: post to the storage target. No auth header — upload_params
+            # carry the signed credentials. Don't auto-follow the redirect so we
+            # can finalize it ourselves with our bearer.
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                store_resp = await client.post(
+                    upload_url, data=upload_params, files=files, follow_redirects=False
+                )
+            if store_resp.status_code not in _STORE_THROTTLED:
+                break
+            retry_after = store_resp.headers.get("Retry-After")
+            if attempt == _STORE_ATTEMPTS:
+                logger.warning(
+                    "Canvas file storage refused %s with %d on all %d tries (Retry-After %r)",
+                    filename, store_resp.status_code, _STORE_ATTEMPTS, retry_after,
+                )
+                break
+            wait = _retry_after_seconds(store_resp, default=2.0 * attempt)
+            logger.warning(
+                "Canvas file storage answered %d for %s (Retry-After %r); "
+                "starting the upload again in %.0fs (try %d of %d)",
+                store_resp.status_code, filename, retry_after, wait,
+                attempt + 1, _STORE_ATTEMPTS,
             )
+            await asyncio.sleep(wait)
 
         if store_resp.status_code in (200, 201):
             try:

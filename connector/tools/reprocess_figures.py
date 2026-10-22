@@ -41,8 +41,8 @@ from ..canvas.state import CanvasJob, get_job, put_job
 from ..canvas.tenant import tk
 from ..dependencies import get_redis_client
 from ..workers.reflow_bridge_worker import (
-    _FIGURE_FOLDER,
     _canvas_client_for_job,
+    _figure_folder,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ async def _reprocess_one(redis, job: CanvasJob) -> dict[str, int]:
 
     canvas = await _canvas_client_for_job(redis, job)
     pdf_bytes = await canvas.download_file(job.canvas_file_id)
+    folder = await _figure_folder(canvas, job.canvas_course_id)
 
     reflow = ReflowClient()
     status = await reflow.get_status(job.reflow_job_id)
@@ -110,7 +111,7 @@ async def _reprocess_one(redis, job: CanvasJob) -> dict[str, int]:
                 canvas_fig_name,
                 figure_bytes,
                 content_type=content_type,
-                folder_path=_FIGURE_FOLDER,
+                folder_path=folder,
             )
             canvas_url = str(uploaded.get("url") or "")
             if canvas_url:

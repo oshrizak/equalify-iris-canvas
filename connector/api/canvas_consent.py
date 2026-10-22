@@ -149,7 +149,7 @@ async def consent_submit(
     if not (agree_processing and agree_pii and agree_responsibility):
         raise HTTPException(
             status_code=400,
-            detail="You must agree to all three clauses to use Reflow.",
+            detail="You must agree to all three clauses to use Iris.",
         )
 
     record = ConsentRecord(
@@ -272,7 +272,7 @@ def _render_page(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Reflow — Authorization &amp; Disclaimer</title>
+  <title>Iris — Authorization &amp; Disclaimer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {{
@@ -400,12 +400,12 @@ def _render_page(
   <main role="main">
     <h1>Authorization &amp; Disclaimer</h1>
     <p class="lede">Welcome{(' ' + safe_user) if safe_user else ''}. Before using
-       Reflow, please review and acknowledge the items below.</p>
+       Iris, please review and acknowledge the items below.</p>
     {banner}
 
-    <h2>What Reflow does</h2>
+    <h2>What Iris does</h2>
     <ul>
-      <li>Reflow processes course materials <strong>you upload to Canvas</strong>
+      <li>Iris processes course materials <strong>you upload to Canvas</strong>
           to generate accessible versions (HTML, ePub, audio, OCR'd PDF,
           Braille, plain text, translations) for students.</li>
       <li>Each page of a document is sent, as an image, to your institution's
@@ -426,7 +426,7 @@ def _render_page(
         <span id="checks-label" class="sr-only">Acknowledgment checkboxes</span>
         <label>
           <input type="checkbox" name="agree_processing" value="yes" required>
-          <span>I authorize Reflow to process documents I upload to Canvas
+          <span>I authorize Iris to process documents I upload to Canvas
                 through the AI provider for the purpose of generating accessible
                 formats.</span>
         </label>
@@ -441,7 +441,7 @@ def _render_page(
         <label>
           <input type="checkbox" name="agree_responsibility" value="yes" required>
           <span>I remain responsible for the content of materials I upload.
-                Reflow is an accessibility-conversion assistant, not a content
+                Iris is an accessibility-conversion assistant, not a content
                 review service, and I will review the generated outputs before
                 publishing them to students.</span>
         </label>

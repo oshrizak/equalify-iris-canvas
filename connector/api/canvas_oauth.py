@@ -194,7 +194,7 @@ async def authorize(
     import html as _h
     safe_url = _h.escape(url, quote=True)
     body = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Authorizing Reflow...</title>
+<html lang="en"><head><meta charset="utf-8"><title>Authorizing Iris...</title>
 <style>body{{font:14px system-ui,sans-serif;padding:2rem;color:#1d1d1d;}}
 a{{color:#0a5fb5;}}</style></head><body>
 <p>Redirecting to Canvas for one-time authorization...</p>
@@ -343,10 +343,10 @@ async def callback(
     # from this tool's origin; the overlay validates the message ``type``.
     if stashed.popup:
         body = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Reflow authorized</title>
+<html lang="en"><head><meta charset="utf-8"><title>Iris authorized</title>
 <style>body{font:14px system-ui,sans-serif;padding:2rem;color:#1d1d1d;text-align:center;}</style>
 </head><body>
-<p>✓ Reflow is authorized. You can close this window.</p>
+<p>✓ Iris is authorized. You can close this window.</p>
 <script>
   try {
     if (window.opener && !window.opener.closed) {

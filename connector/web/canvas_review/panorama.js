@@ -1,5 +1,5 @@
 /*
- * Equalify Reflow — Panorama-style Canvas overlay.
+ * Equalify Iris for Canvas — Panorama-style Canvas overlay.
  *
  * Surfaces:
  *   - Files index rows (data-testid="table-row")
@@ -21,7 +21,7 @@
   })();
   var ORIGIN = (function () { if (!SCRIPT) return ""; try { return new URL(SCRIPT.src).origin; } catch (_) { return ""; } })();
   var INST = (function () { if (!SCRIPT) return ""; try { return new URL(SCRIPT.src).searchParams.get("inst") || ""; } catch (_) { return ""; } })();
-  if (!ORIGIN || !INST) { console.warn("[reflow] panorama.js loaded without origin/inst; aborting"); return; }
+  if (!ORIGIN || !INST) { console.warn("[iris] panorama.js loaded without origin/inst; aborting"); return; }
 
   var STATE = { courseId: null, userRole: null, scoresByFilename: null, csrfToken: null, oauth: null };
   // File extensions Reflow can process. Mirrors the watcher's _CONVERTIBLE_EXTS
@@ -129,7 +129,7 @@
       var data = await r.json();
       STATE.scoresByFilename = data.by_filename || {};
       return STATE.scoresByFilename;
-    } catch (e) { console.warn("[reflow] scored_files failed", e); return {}; }
+    } catch (e) { console.warn("[iris] scored_files failed", e); return {}; }
   }
 
   // Fetch the per-session CSRF token bound to the LTI session cookie.
@@ -147,7 +147,7 @@
       STATE.csrfToken = data.csrf_token || null;
       return STATE.csrfToken;
     } catch (e) {
-      console.warn("[reflow] csrf token fetch failed", e);
+      console.warn("[iris] csrf token fetch failed", e);
       STATE.csrfToken = null;
       return null;
     }
@@ -175,7 +175,7 @@
       STATE.consent = await r.json();
       return STATE.consent;
     } catch (e) {
-      console.warn("[reflow] consent status fetch failed", e);
+      console.warn("[iris] consent status fetch failed", e);
       STATE.consent = { agreed: false, reason: "network_error" };
       return STATE.consent;
     }
@@ -196,7 +196,7 @@
       STATE.oauth = await r.json();
       return STATE.oauth;
     } catch (e) {
-      console.warn("[reflow] oauth status fetch failed", e);
+      console.warn("[iris] oauth status fetch failed", e);
       STATE.oauth = { authorized: false, is_instructor: false, has_session: false };
       return STATE.oauth;
     }
@@ -1497,12 +1497,12 @@
     var o = STATE.oauth;
     if (!o || o.authorized) return "";
     if (!o.is_instructor && STATE.userRole !== "Instructor") return "";
-    var msg = "Authorize Reflow to read your course files and publish accessible pages. " +
+    var msg = "Authorize Iris to read your course files and publish accessible pages. " +
               "Until you do, new uploads won't be converted in your courses.";
     return '<section id="reflow-pn-auth-banner" class="reflow-pn-consent-banner" role="status">' +
            '  <span class="reflow-pn-consent-icon" aria-hidden="true">🔑</span>' +
            '  <span class="reflow-pn-consent-text">' + esc(msg) + '</span>' +
-           '  <button class="reflow-pn-consent-btn reflow-pn-auth-btn" type="button">Authorize Reflow</button>' +
+           '  <button class="reflow-pn-consent-btn reflow-pn-auth-btn" type="button">Authorize Iris</button>' +
            '</section>';
   }
 
@@ -1513,12 +1513,12 @@
     if (STATE.userRole !== "Instructor") return "";
     var msg = "Authorization required to process new documents through the AI provider.";
     if (c.reason === "version_changed") {
-      msg = "The Reflow disclaimer has been updated. Please re-authorize to continue using the tool.";
+      msg = "The Iris disclaimer has been updated. Please re-authorize to continue using the tool.";
     }
     return '<section id="reflow-pn-consent-banner" class="reflow-pn-consent-banner" role="status">' +
            '  <span class="reflow-pn-consent-icon" aria-hidden="true">⚠️</span>' +
            '  <span class="reflow-pn-consent-text">' + esc(msg) + '</span>' +
-           '  <a class="reflow-pn-consent-btn" href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">Authorize Reflow</a>' +
+           '  <a class="reflow-pn-consent-btn" href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">Authorize Iris</a>' +
            '</section>';
   }
 
@@ -1537,7 +1537,7 @@
     if (STATE.userRole === "Instructor") {
       return '<span class="reflow-pn-footer-text">' +
              '  Alternative formats are visible to students. ' +
-             '  <a href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">View Reflow authorization terms</a>' +
+             '  <a href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">View Iris authorization terms</a>' +
              '</span>';
     }
     return '<span class="reflow-pn-footer-text">Alternative formats are visible to students.</span>';
@@ -2310,10 +2310,10 @@
       btn.className = "reflow-pn-dial reflow-pn-pending";
       btn.setAttribute("aria-label",
         "Awaiting accessibility scan for " + filename +
-        ". Reflow checks new uploads about once a minute."
+        ". Iris checks new uploads about once a minute."
       );
       btn.title =
-        "Awaiting accessibility scan — Reflow processes new uploads " +
+        "Awaiting accessibility scan — Iris processes new uploads " +
         "automatically (about once a minute). Refresh in a few minutes " +
         "to see results.";
       btn.style.cssText =
@@ -2459,7 +2459,7 @@
     setTimeout(function () {
       scheduleScan._pending = false;
       decorateAllPdfs().catch(function (e) {
-        console.warn("Reflow Panorama scan failed:", e);
+        console.warn("Iris overlay scan failed:", e);
       });
     }, 250);
   }
@@ -2467,35 +2467,35 @@
   function init() {
     if (init._started) return;
     init._started = true;
-    try { injectStyles(); } catch (e) { console.warn("Reflow Panorama: injectStyles failed", e); }
-    try { getEnv(); } catch (e) { console.warn("Reflow Panorama: getEnv failed", e); }
+    try { injectStyles(); } catch (e) { console.warn("Iris overlay: injectStyles failed", e); }
+    try { getEnv(); } catch (e) { console.warn("Iris overlay: getEnv failed", e); }
     // Fetch the CSRF token in the background. The first scheduled
     // scan can fire before the token arrives -- that's fine because
     // scans are read-only. State-changing actions check STATE.csrfToken
     // at submit time.
     loadCsrfToken().catch(function (e) {
-      console.warn("Reflow Panorama: CSRF fetch failed", e);
+      console.warn("Iris overlay: CSRF fetch failed", e);
     });
     // Check Canvas-OAuth authorization in the background so the modal can
     // surface an "Authorize Reflow" prompt to instructors who haven't yet
     // granted access. Read-only; safe to fire alongside the first scan.
     _installOAuthMessageListener();
     loadOAuthStatus().catch(function (e) {
-      console.warn("Reflow Panorama: OAuth status fetch failed", e);
+      console.warn("Iris overlay: OAuth status fetch failed", e);
     });
     // Load the AI-API consent state too, so the modal can hide the
     // "Authorization required…" banner for instructors who already accepted
     // (and show "✓ Authorized" in the footer). Without this STATE.consent
     // stayed undefined and the banner showed unconditionally.
     loadConsentStatus().catch(function (e) {
-      console.warn("Reflow Panorama: consent status fetch failed", e);
+      console.warn("Iris overlay: consent status fetch failed", e);
     });
     scheduleScan();
     try {
       var obs = new MutationObserver(scheduleScan);
       obs.observe(document.body, { childList: true, subtree: true });
     } catch (e) {
-      console.warn("Reflow Panorama: MutationObserver unavailable", e);
+      console.warn("Iris overlay: MutationObserver unavailable", e);
     }
   }
 

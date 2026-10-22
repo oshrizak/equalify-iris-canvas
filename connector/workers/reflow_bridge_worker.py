@@ -77,7 +77,10 @@ from ..lti.platform_store import (
 # Course folder where converted-document figures are uploaded. Appears in
 # the course Files list; faculty can lock/hide it if they prefer. Keeping a
 # single named folder keeps the generated images tidy and easy to find.
-_FIGURE_FOLDER = "Reflow Generated Images"
+_FIGURE_FOLDER = "Iris Generated Images"
+# The folder's name before the move to Iris. A course that already has it
+# keeps using it, so the rename does not leave two image folders behind.
+_LEGACY_FIGURE_FOLDER = "Reflow Generated Images"
 # Iris figures: wait this long after an attempt that left figures behind,
 # and stop after this many attempts (see _resolve_iris_figures).
 _FIGURE_RETRY_SECONDS = 15 * 60
@@ -93,6 +96,21 @@ def _slugify(title: str) -> str:
     """
     s = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
     return s or "page"
+
+
+async def _figure_folder(canvas: CanvasClient, course_id: str) -> str:
+    """The course folder for figure uploads: the current name, unless only the old one exists."""
+    try:
+        folders = await canvas.list_course_folders(course_id)
+    except Exception as exc:  # noqa: BLE001 - not knowing just means the current name
+        logger.debug("figure folder lookup failed for course %s: %s", course_id, exc)
+        return _FIGURE_FOLDER
+    paths = {str(f.get("full_name") or "").strip().lower() for f in folders}
+    if f"course files/{_FIGURE_FOLDER}".lower() not in paths \
+            and f"course files/{_LEGACY_FIGURE_FOLDER}".lower() in paths:
+        return _LEGACY_FIGURE_FOLDER
+    return _FIGURE_FOLDER
+
 
 _BRIDGE_SCOPES = [
     "url:POST|/api/v1/courses/:course_id/pages",
@@ -573,7 +591,9 @@ async def _drive_reflow_job(
         if str(f.get("figure_id") or "").strip()
     )
     pdf_bytes: bytes | None = None
+    folder = _FIGURE_FOLDER
     if needs_pdf and figures:
+        folder = await _figure_folder(canvas, job.canvas_course_id)
         try:
             pdf_bytes = await canvas.download_file(job.canvas_file_id)
         except Exception:  # noqa: BLE001
@@ -634,7 +654,7 @@ async def _drive_reflow_job(
                 canvas_fig_name,
                 figure_bytes,
                 content_type=content_type,
-                folder_path=_FIGURE_FOLDER,
+                folder_path=folder,
             )
             canvas_url = str(uploaded.get("url") or "")
             if canvas_url:
@@ -651,7 +671,7 @@ async def _drive_reflow_job(
         job.figure_canvas_urls = figure_canvas_urls
         logger.info(
             "Bridge: uploaded %d/%d figures to Canvas folder %r for job %s",
-            len(figure_canvas_urls), len(figures), _FIGURE_FOLDER, job.reflow_job_id,
+            len(figure_canvas_urls), len(figures), folder, job.reflow_job_id,
         )
 
     title = _title_from_filename(job.canvas_file_name)
@@ -1045,11 +1065,14 @@ async def _resolve_iris_figures(redis: Redis, canvas: CanvasClient, job: CanvasJ
 
     uploaded = 0
     failed = 0
+    folder: str | None = None
     for f in todo:
         fig = extracted.get(f.ref)
         if fig is None:
             unmatched.add(f.ref)
             continue
+        if folder is None:
+            folder = await _figure_folder(canvas, job.canvas_course_id)
         ext = {"image/jpeg": "jpg", "image/gif": "gif"}.get(fig.content_type, "png")
         # Prefixed with the Canvas file id: figure refs are per document, and
         # every document's "p1-1" would otherwise overwrite the last one in
@@ -1058,7 +1081,7 @@ async def _resolve_iris_figures(redis: Redis, canvas: CanvasClient, job: CanvasJ
         try:
             result = await canvas.upload_course_file(
                 job.canvas_course_id, name, fig.image_bytes,
-                content_type=fig.content_type, folder_path=_FIGURE_FOLDER,
+                content_type=fig.content_type, folder_path=folder,
             )
         except Exception:  # noqa: BLE001 - one bad figure shouldn't sink the page
             logger.exception("Bridge: figure upload failed for %s (%s)", job.reflow_job_id, f.ref)

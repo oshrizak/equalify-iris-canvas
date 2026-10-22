@@ -241,7 +241,7 @@ async def launch(
         raise HTTPException(
             status_code=403,
             detail=(
-                "This Reflow installation has been revoked. "
+                "This installation has been revoked. "
                 "Contact your Canvas administrator."
             ),
         )
@@ -344,7 +344,7 @@ async def tool_config(request: Request) -> JSONResponse:
     base = str(request.base_url).rstrip("/")
     return JSONResponse(
         {
-            "title": "Equalify Reflow - Accessible Documents",
+            "title": "Equalify Iris - Accessible Documents",
             "description": (
                 "Automatically converts PDFs uploaded to Canvas into "
                 "accessible, reflowable Canvas Pages."

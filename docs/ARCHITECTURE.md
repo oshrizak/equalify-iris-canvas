@@ -204,8 +204,9 @@ page's position within its Iris session). Stitching renames each to
 that page's embedded rasters in reading order — skipping scanned-page
 backgrounds, tiny images and running-head furniture — and declines when the
 match is ambiguous. Matched figures are uploaded to the course folder
-(`Reflow Generated Images`, the folder name kept for existing courses);
-unmatched ones render as visible descriptions naming the original page.
+`Iris Generated Images` (a course that already has `Reflow Generated Images`
+keeps using that one); unmatched ones render as visible descriptions naming
+the original page.
 Vector graphics have no raster to lift and always render as descriptions.
 
 The `/canvas/panorama/alt/{job}/figures/{ref}` route serves a figure's

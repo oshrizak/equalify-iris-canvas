@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="{{ csrf_token }}">
-<title>Accessible Documents — Reflow</title>
+<title>Accessible Documents — Iris</title>
 <style>
   /* ------------------------------------------------------------------
      Tokens. Everything visual resolves through these, so an institution
@@ -207,7 +207,7 @@
 <div class="wrap">
   <header class="page">
     <h1>Accessible Documents</h1>
-    <p class="lede">Hello, {{ user_name }}. Every PDF Reflow knows about in this course, and where it stands. Anything waiting on your decision is listed first.</p>
+    <p class="lede">Hello, {{ user_name }}. Every PDF Iris knows about in this course, and where it stands. Anything waiting on your decision is listed first.</p>
   </header>
 
   <div class="tiles" id="tiles" role="group" aria-label="Filter documents by state" hidden>
@@ -262,7 +262,7 @@
   const search   = document.getElementById("q");
 
   // Each state gets a word as well as a colour and a dot shape. The PII
-  // gate blocks Reflow before it produces anything; the accessibility
+  // gate blocks Iris before it produces anything; the accessibility
   // gate is the last step before students see the page. Both need you.
   const LABELS = {
     awaiting_approval: ["Privacy review",  "pill-need"],
@@ -456,7 +456,7 @@
   setInterval(load, 30000);
 
   // ---- Automatic conversion switch -----------------------------------
-  // Reflow does nothing to a course until someone turns it on here. The
+  // Iris does nothing to a course until someone turns it on here. The
   // drop folder still works either way, which is how most people start.
   const optinBox   = document.getElementById("optin");
   const optinState = document.getElementById("optin-state");
@@ -471,8 +471,8 @@
       ? 'Automatic conversion is <span class="state-on">ON</span> for this course.'
       : 'Automatic conversion is <span class="state-off">OFF</span> for this course.';
     let help = on
-      ? "Reflow checks this course's files, modules, pages and assignments and converts new documents as they appear."
-      : "Reflow is not scanning this course. Nothing is converted unless you put it in the drop folder.";
+      ? "Iris checks this course's files, modules, pages and assignments and converts new documents as they appear."
+      : "Iris is not scanning this course. Nothing is converted unless you put it in the drop folder.";
     if (d.drop_folder) {
       help += ' Either way, you can copy a single PDF into the "' + d.drop_folder +
               '" folder in Course Files to convert just that one.';
@@ -518,7 +518,7 @@
       }
       await loadOptin();
     } catch (_) {
-      optinState.textContent = "Could not reach Reflow. Please try again.";
+      optinState.textContent = "Could not reach Iris. Please try again.";
       optinBtn.disabled = false;
     }
   });

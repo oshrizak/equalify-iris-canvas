@@ -121,12 +121,27 @@ background.
 ## 5 · Theme-Editor overlay (optional but recommended)
 
 The panorama overlay is what surfaces dial badges and "Convert" buttons in
-Canvas's native file UI. Admin → Themes → edit the active theme → Append
-the following inline:
+Canvas's native file UI. A Canvas theme takes a JavaScript file, not HTML, so
+the overlay is loaded by a few lines in the theme's JS: Admin → Themes →
+open the active theme → Upload → JavaScript file.
 
-```html
-<script src="{LTI_PUBLIC_URL}/panorama.js" defer></script>
+```js
+(function () {
+  // Courses that load the overlay. Leave the list empty to load it everywhere.
+  var COURSES = ['12345'];
+  var m = location.pathname.match(/^\/courses\/(\d+)(?:\/|$)/);
+  if (!m || (COURSES.length && COURSES.indexOf(m[1]) === -1)) return;
+  var s = document.createElement('script');
+  s.src = '{LTI_PUBLIC_URL}/panorama.js?inst=myschool';  // inst is required
+  s.async = true;
+  document.head.appendChild(s);
+})();
 ```
+
+An upload replaces the theme's whole JS file, so add these lines to the file
+the theme already has rather than uploading them alone. Canvas also moves
+between some pages without a reload; a loader that should catch those
+navigations re-runs its check on `history.pushState` and `popstate`.
 
 The bundle is permission-aware: students see read-only dials, instructors see
 review actions. Cache-Control is `no-cache` so updates ship without a theme

@@ -50,7 +50,17 @@ async def test_course_starts_disabled(client, redis_client):
 
     assert body["enabled"] is False, "a course must not be scanned until asked"
     assert body["can_change"] is True
-    assert body["drop_folder"], "faculty need to be told the folder name"
+    assert body["drop_folder"] == "Iris - Convert to Accessible", "faculty need to be told the folder name"
+
+
+@pytest.mark.asyncio
+async def test_the_page_names_the_folder_the_course_actually_has(client, redis_client):
+    """A course set up before the move to Iris keeps its Reflow-named folder."""
+    from connector.canvas.state import remember_drop_folder_name
+
+    await remember_drop_folder_name(redis_client, COURSE, "Reflow - Convert to Accessible")
+    client.cookies.set(SESSION_COOKIE, await _session(redis_client, [INSTRUCTOR]))
+    assert client.get(URL).json()["drop_folder"] == "Reflow - Convert to Accessible"
 
 
 @pytest.mark.asyncio

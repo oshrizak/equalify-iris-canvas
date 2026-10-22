@@ -13,7 +13,7 @@ bridge wrote belong to Canvas and keep working without either service.
 
 ## What changes for faculty
 
-Say these out loud before the switch; three of them change what people see.
+Say these out loud before the switch; four of them change what people see.
 
 1. **The disclaimer is shown again.** Consent version 1.0 told faculty that
    documents are scanned for personal information and that PII is redacted
@@ -43,6 +43,11 @@ Say these out loud before the switch; three of them change what people see.
 6. **Word and PowerPoint** files are converted to PDF (LibreOffice) before
    Iris reads them. Layout-heavy slides convert well; complex Word styling
    may not survive exactly.
+7. **The tool says Iris instead of Reflow** on its pages, buttons and
+   disclaimer. New courses get the drop folder "Iris - Convert to
+   Accessible"; a course that already has "Reflow - Convert to Accessible"
+   keeps using it, and the Accessible Documents page names whichever one
+   the course has.
 
 ## Before you start
 

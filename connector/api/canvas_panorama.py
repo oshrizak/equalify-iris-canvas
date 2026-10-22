@@ -178,13 +178,13 @@ async def oauth_status(
     session_id: str | None = Cookie(default=None, alias=SESSION_COOKIE),
     redis: Redis = Depends(get_redis_client),
 ) -> JSONResponse:
-    """Whether the current instructor has authorized Reflow against Canvas.
+    """Whether the current instructor has authorized Iris against Canvas.
 
     The overlay calls this on load. Authorization is per (platform, user):
     without it the watcher can't read this instructor's course files and the
     bridge can't publish accessible Pages on their behalf. When
     ``is_instructor`` is true and ``authorized`` is false, the overlay shows
-    an "Authorize Reflow" prompt (opened in a popup, not a full-window nav).
+    an "Authorize Iris" prompt (opened in a popup, not a full-window nav).
 
     Always 200 with a JSON body — the overlay treats a missing/expired
     session as simply "not authorized" rather than an error.
@@ -953,8 +953,9 @@ async def _compute_score(job_id: str, redis: Redis | None = None) -> Score:
     fidelity — so a clean accessible page reads high, problems (missing alt
     text, headings, language) pull it down, and faculty edits move the number.
     Per-file variance is real because it reflects each document's actual HTML.
-    Falls back to 'unscanned' when the HTML can't be resolved yet (job not
-    completed, or Reflow unavailable) so we never fabricate a number.
+    Falls back to 'unscanned' when the HTML can't be resolved yet (still
+    converting, or a legacy document out of reach) so we never fabricate a
+    number. That is an ordinary state, not an error, so it is not logged as one.
 
     (The older conversion-quality heuristic — ``score_from_reflow_result`` over
     ``job.signals`` — is retained in the codebase but no longer drives the dial;
@@ -971,10 +972,18 @@ async def _compute_score(job_id: str, redis: Redis | None = None) -> Score:
         score = _accessibility_score_from_wcag(report)
         return Score(score=score, severity=severity_of(score),
                      available_formats=list(LIVE_FORMATS), status="scored")
+    except ContentUnavailableError as exc:
+        logger.debug("No score yet for %s: %s", job_id, exc)
+    except HTTPException as exc:
+        # _resolve_html answers "no document (yet, or any more)" as 404/409/410.
+        if exc.status_code in (404, 409, 410):
+            logger.debug("No score yet for %s: %s", job_id, exc.detail)
+        else:
+            logger.exception("Accessibility (WCAG) score failed for %s", job_id)
     except Exception:
         logger.exception("Accessibility (WCAG) score failed for %s", job_id)
-        return Score(score=None, severity=None,
-                     available_formats=list(LIVE_FORMATS), status="unscanned")
+    return Score(score=None, severity=None,
+                 available_formats=list(LIVE_FORMATS), status="unscanned")
 
 
 async def _fetch_markdown(redis: Redis, job_id: str) -> str:
@@ -1430,7 +1439,7 @@ async def pii_decision(
             status_code=400,
             detail=(
                 "Could not identify the reviewer for this decision. "
-                "Re-launch Reflow from Canvas and try again."
+                "Re-launch Iris from Canvas and try again."
             ),
         )
     try:
