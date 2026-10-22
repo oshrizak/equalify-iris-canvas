@@ -60,6 +60,7 @@ from ..canvas.state import (
     CONSENT_AUDIT_KEY,
     CONSENT_KEY,
     content_keys,
+    forget_job_files,
     forget_job_pointers,
     job_from_dict,
 )
@@ -175,6 +176,7 @@ async def _erase(redis: Any, user_id: str, *, commit: bool) -> dict[str, Any]:
                 # the pointers that would alias a re-upload onto this job.
                 for content_key in content_keys(jid):
                     await redis.delete(content_key)
+                forget_job_files(jid)
                 try:
                     await forget_job_pointers(redis, job_from_dict(data))
                 except Exception:  # noqa: BLE001 - erasure goes on regardless

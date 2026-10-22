@@ -238,7 +238,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["*"],
+    # A browser reads "*" literally on a request made with credentials, so
+    # the overlay's downloads (which send the LTI cookie, for instructor
+    # previews) need the download's file name listed by name.
+    expose_headers=["*", "Content-Disposition", "X-Accessible-Pdf"],
 )
 
 app.include_router(lti_router)

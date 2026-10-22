@@ -17,6 +17,9 @@ Endpoints consumed:
   * ``GET  /v1/sessions/{id}/output``    the HTML (409 until ready)
   * ``GET  /v1/sessions/{id}/diagnostics`` token counts and timings
   * ``POST /v1/sessions/{id}/close``     a human accepted the output
+  * ``POST /v1/sessions/{id}/pdf``       the session's own PDF, tagged from
+                                         its HTML (only where Iris runs
+                                         equalify-iris-pdf)
 
 Auth is Iris's optional shared secret (``server.api_token``), sent as
 ``Authorization: Bearer``. Iris has no per-user identity: every session
@@ -33,6 +36,8 @@ which :class:`IrisApiError` carries through so callers can branch on
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 import time
 from dataclasses import dataclass, field
@@ -149,6 +154,28 @@ class IrisLimits:
         )
 
 
+@dataclass(frozen=True)
+class TaggedPdf:
+    """``POST /v1/sessions/{id}/pdf``: the session's source PDF, tagged.
+
+    ``report`` is the tagger's report (per-page notes and ``warnings``,
+    such as ``page_not_in_html`` for a page Iris could not extract).
+    """
+
+    filename: str
+    pdf: bytes
+    report: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def warning_codes(self) -> list[str]:
+        codes: list[str] = []
+        for warning in self.report.get("warnings") or []:
+            code = warning.get("code") if isinstance(warning, dict) else warning
+            if code and str(code) not in codes:
+                codes.append(str(code))
+        return codes
+
+
 def _int_or_none(value: Any) -> int | None:
     try:
         return int(value) if value is not None else None
@@ -244,6 +271,7 @@ class IrisClient:
             upload_timeout if upload_timeout is not None
             else getattr(settings, "iris_upload_timeout_seconds", 300.0)
         )
+        self._tag_timeout = float(getattr(settings, "iris_tagged_pdf_timeout_seconds", 330.0))
         self._transport = transport
 
     # ---- plumbing -----------------------------------------------------
@@ -384,6 +412,42 @@ class IrisClient:
         (already closed, or re-running) and is safe to ignore.
         """
         return (await self._post(f"/sessions/{session_id}/close", f"close ({session_id})")).json()
+
+    async def tagged_pdf(self, session_id: str) -> TaggedPdf:
+        """The session's own PDF, tagged from its HTML (``POST .../pdf``).
+
+        Only a session made from one PDF has one (``409 no_source_pdf``
+        otherwise), only once it has finished (``409 invalid_state``), and
+        only on a deployment that runs equalify-iris-pdf (``404
+        tagged_pdf_unavailable``; ``GET /v1/limits`` says ``tagged_pdf``).
+        Iris tags two PDFs at a time and answers a third with ``503 busy``
+        and ``Retry-After``. Nothing is stored or changed in Iris, so the
+        caller may simply ask again. No form values are sent: the alternate
+        format is the document as published, not a filled-in copy.
+        """
+        resp = await self._post(
+            f"/sessions/{session_id}/pdf", f"tagged PDF ({session_id})",
+            timeout=self._tag_timeout, json={},
+        )
+        try:
+            payload = resp.json()
+            data = base64.b64decode(str(payload.get("pdf") or ""), validate=True)
+        except (ValueError, binascii.Error, AttributeError) as exc:
+            raise IrisApiError(
+                f"Iris tagged PDF ({session_id}) failed: the answer was not a PDF",
+                status_code=resp.status_code,
+            ) from exc
+        if not data.startswith(b"%PDF-"):
+            raise IrisApiError(
+                f"Iris tagged PDF ({session_id}) failed: the answer was not a PDF",
+                status_code=resp.status_code,
+            )
+        report = payload.get("report")
+        return TaggedPdf(
+            filename=str(payload.get("filename") or ""),
+            pdf=data,
+            report=report if isinstance(report, dict) else {},
+        )
 
 
 def clear_limits_cache() -> None:

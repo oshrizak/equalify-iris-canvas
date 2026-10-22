@@ -582,9 +582,10 @@ async def approve(
             )
     job.status = "published"
     await put_job(redis, job)
-    from .canvas_panorama import maybe_close_iris_sessions
+    from .canvas_panorama import maybe_close_iris_sessions, maybe_make_tagged_pdf
 
     await maybe_close_iris_sessions(redis, job)
+    await maybe_make_tagged_pdf(redis, job)
     return JSONResponse({
         "ok": True,
         "page_url": job.canvas_page_url or "",

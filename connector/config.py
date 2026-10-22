@@ -84,6 +84,33 @@ class Settings(BaseSettings):
             "was accepted."
         ),
     )
+    iris_tagged_pdf: bool = Field(
+        default=True,
+        description=(
+            "Serve the 'Searchable PDF' format as Iris's tagged PDF: the original "
+            "file, page for page, with a structure tree and a text layer built "
+            "from Iris's HTML. Needs an Iris that runs equalify-iris-pdf (GET "
+            "/v1/limits answers tagged_pdf: true). When this is off, when Iris "
+            "cannot tag a document, or when faculty edited the document (Iris "
+            "cannot see their edits), the connector renders its own PDF."
+        ),
+    )
+    iris_tagged_pdf_timeout_seconds: float = Field(
+        ge=30, le=1800, default=330,
+        description=(
+            "How long to wait for Iris to tag one part. Iris gives its tagger "
+            "300 seconds by default (tagged_pdf.timeout_seconds)."
+        ),
+    )
+    iris_tagged_pdf_dir: str = Field(
+        default="/app/data/tagged-pdf",
+        description=(
+            "Where the connector keeps the tagged PDFs Iris made, so each is "
+            "made once and outlives Iris's session retention. "
+            "docker-compose.yml mounts a volume here. Empty: keep none, and "
+            "ask Iris every time."
+        ),
+    )
     iris_estimated_cost_per_page_cents: int = Field(
         ge=0, le=10_000, default=11,
         description=(

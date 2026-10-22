@@ -175,15 +175,30 @@ RenderedPage, which carries the document language Iris reported:
   math as `$...$`/`$$...$$`, print pages as `[Page N]`. Legacy jobs:
   Reflow's own markdown, passed through.
 - **ePub** — `ebooklib` (EPUB3), in the document's language.
-- **Searchable PDF (auto-route)** —
-  `canvas/alt_formats.pdf_has_text_layer` decides. Image-only scans
-  go through `ocrmypdf`. Born-digital PDFs go through WeasyPrint with
-  `pdf_variant='pdf/ua-1'` for a real Tagged PDF (structure tree,
-  reading order, alt text). MathML is turned into LaTeX first, then math
-  is pre-rendered to inline SVG via `canvas/math_render`, because
-  WeasyPrint neither runs JavaScript nor lays out MathML.
+- **Searchable PDF** — Iris's tagged PDF (`canvas/iris_tagged_pdf`):
+  `POST /v1/sessions/{id}/pdf` hands back the PDF a session was made from,
+  tagged from Iris's HTML by equalify-iris-pdf, so the student gets the
+  original pages with a structure tree and a text layer (scans included).
+  A document converted in parts is tagged part by part and joined
+  (`canvas/pdf_merge`: each part's ParentTree keys shifted, its elements
+  moved under one Document, colliding ids renamed with the `/Headers` that
+  name them, the PDF/UA-1 claim kept only when every part made it).
+  Approval makes it in the background; it is kept on disk
+  (`canvas/tagged_pdf_store`, `IRIS_TAGGED_PDF_DIR`), keyed by the sessions
+  it came from, so it is made once and outlives Iris's session retention,
+  and every purge path deletes it with the job's content. A document
+  faculty edited gets the connector's own PDF instead, because Iris tags
+  from its own HTML and cannot see their edits; so does one Iris cannot tag
+  (an older Iris, a session it no longer has). The connector's own:
+  WeasyPrint with `pdf_variant='pdf/ua-1'` renders the accessible HTML into
+  a tagged PDF (MathML turned into LaTeX first, then pre-rendered to inline
+  SVG via `canvas/math_render`, because WeasyPrint neither runs JavaScript
+  nor lays out MathML); an untouched image-only scan goes through
+  `ocrmypdf` for a text layer.
 - **Audio MP3** — Amazon Polly neural TTS, chunked at ~2800 chars per
-  Polly call.
+  Polly call. Listed as under development (`under_development` in the
+  score payload, 404 at its URL) while boto3 finds no AWS credentials; the
+  same goes for Translate without `ANTHROPIC_API_KEY`.
 - **Translate** — Anthropic Claude (Sonnet 4.5) via the Messages API, from
   the same LaTeX-in-text form as plain text. Prompt explicitly preserves
   LaTeX and `\ce{}` markup verbatim so equations don't get translated into

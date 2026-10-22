@@ -42,6 +42,9 @@ dependencies = [
     # server-side with no browser, and liblouisutdml reads MathML.
     "latex2mathml>=3.77",
     "ocrmypdf>=16.0",
+    # Joining the tagged PDFs Iris makes for a document converted in parts
+    # (connector.canvas.pdf_merge). ocrmypdf already depends on it.
+    "pikepdf>=8.7",
     "pdf2image>=1.17.0",
     "pymupdf>=1.24",
     # Translation calls Claude directly (Sonnet 4.5). The source fork's

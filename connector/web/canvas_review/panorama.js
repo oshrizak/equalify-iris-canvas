@@ -48,9 +48,9 @@
 
   // Catalogue of formats the modal shows. live=true means the backend
   // is wired; the rest are visible-but-disabled placeholders.
-  // ``download: true`` means the format card should auto-download to
-  // the user's downloads folder without opening a new tab. That's the
-  // right UX for binary / file artifacts (PDF, EPUB, MP3, BRF, plain
+  // ``download: true`` means the format card saves a file to the user's
+  // downloads folder without opening a new tab (see _wireDownload). That's
+  // the right UX for binary / file artifacts (PDF, EPUB, MP3, BRF, plain
   // text, markdown). Formats that render as a webpage in the browser
   // (HTML preview, HTML-with-math, Translate output, Immersive Reader)
   // stay as ``target="_blank"`` so faculty actually see the rendered
@@ -675,6 +675,94 @@
     return wrap;
   }
 
+  // Downloads go through fetch rather than a plain link. A link's
+  // ``download`` attribute is ignored when it points at another site, and
+  // the connector is not Canvas: a plain link took the Canvas tab away to
+  // raw text, and a failure replaced Canvas with an error page. This keeps
+  // the person on the page, says what is being prepared (Searchable PDF can
+  // take a minute the first time), and explains a failure in words.
+  var DOWNLOAD_EXT = { txt: "txt", markdown: "md", audio: "mp3", ocr: "pdf", epub: "epub", braille: "brf" };
+
+  function _say(statusEl, text) {
+    if (!statusEl) return;
+    statusEl.textContent = "";
+    // A fresh node each time, so the same message twice is announced twice.
+    setTimeout(function () { statusEl.textContent = text; }, 50);
+  }
+
+  function _downloadName(disposition, fallback) {
+    if (!disposition) return fallback;
+    var m = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(disposition);
+    if (m) {
+      try { return decodeURIComponent(m[1].trim()); } catch (e) { /* fall through */ }
+    }
+    m = /filename\s*=\s*"([^"]+)"/i.exec(disposition);
+    return m ? m[1] : fallback;
+  }
+
+  function _wireDownload(el, url, fmt, filename, statusEl) {
+    el.addEventListener("click", function (e) {
+      // Open-in-new-tab and similar clicks keep the browser's own behavior.
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      if (el.getAttribute("aria-busy") === "true") return;
+      var stem = String(filename || "document").replace(/\.[A-Za-z0-9]{1,5}$/, "");
+      var fallback = stem + "." + (DOWNLOAD_EXT[fmt.id] || "bin");
+      el.setAttribute("aria-busy", "true");
+      el.classList.add("is-busy");
+      _say(statusEl, "Preparing " + fmt.label + "\u2026");
+      // With credentials: an instructor's draft preview needs the LTI
+      // cookie. A published document needs none and works either way.
+      fetch(url, { credentials: "include", headers: BACKEND_HEADERS })
+        .then(function (r) {
+          if (!r.ok) {
+            return r.json().catch(function () { return {}; }).then(function (body) {
+              var err = new Error(body && typeof body.detail === "string" ? body.detail : "");
+              err.status = r.status;
+              throw err;
+            });
+          }
+          var name = _downloadName(r.headers.get("Content-Disposition"), fallback);
+          return r.blob().then(function (blob) {
+            var href = URL.createObjectURL(blob);
+            var a = document.createElement("a");
+            a.href = href;
+            a.download = name;
+            a.style.display = "none";
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(function () { URL.revokeObjectURL(href); a.remove(); }, 60000);
+            _say(statusEl, fmt.label + " downloaded (" + name + ").");
+          });
+        })
+        .catch(function (err) {
+          console.warn("[iris] download failed", fmt.id, err);
+          var status = err && err.status;
+          // Two cases a plain navigation still handles: the request never got
+          // an answer this page may read (a CORS or network failure), and an
+          // instructor's draft refused because the browser kept the LTI
+          // cookie out of a cross-site fetch (Safari does). A navigation is
+          // first-party, and every download is an attachment, so the browser
+          // saves it and Canvas stays put.
+          if (!status || (status === 403 && STATE.userRole === "Instructor")) {
+            _say(statusEl, "Downloading " + fmt.label + "…");
+            window.location.href = url;
+            return;
+          }
+          // 4xx details are written for people ("pending faculty review",
+          // "under development"); anything else gets a plain sentence.
+          var msg = (status < 500 && err.message)
+            ? err.message
+            : "It could not be prepared right now. Please try again in a few minutes.";
+          _say(statusEl, fmt.label + ": " + msg);
+        })
+        .then(function () {
+          el.removeAttribute("aria-busy");
+          el.classList.remove("is-busy");
+        });
+    });
+  }
+
   function openFormatsModal(payload, filename) {
     var existing = document.getElementById("reflow-pn-modal");
     if (existing) existing.remove();
@@ -713,7 +801,6 @@
       _renderConsentBanner() +
       '<footer class="reflow-pn-modal-footer">' +
       _renderConsentFooter() +
-      '  <label class="reflow-pn-switch"><input type="checkbox" checked><span class="reflow-pn-switch-slider"></span></label>' +
       '</footer>';
 
     overlay.appendChild(modal);
@@ -760,9 +847,18 @@
     // identical-looking squares.
     var grid = modal.querySelector(".reflow-pn-modal-grid");
     var availableLive = payload.available_formats || ["html", "txt", "markdown"];
+    // Formats this server cannot serve yet (audio needs Amazon Polly,
+    // translation an Anthropic key) come back as under development.
+    var underDevelopment = payload.under_development || [];
+    // One polite status line for every download in the menu: what is being
+    // prepared, what arrived, and why something could not be made.
+    var fmtStatus = document.createElement("p");
+    fmtStatus.className = "reflow-pn-fmt-status";
+    fmtStatus.setAttribute("role", "status");
+    fmtStatus.setAttribute("aria-live", "polite");
     function _buildFmtCard(fmt) {
-      var enabled = fmt.live && (availableLive.indexOf(fmt.id) >= 0
-                                  || fmt.id === "translate"
+      var held = underDevelopment.indexOf(fmt.id) >= 0;
+      var enabled = fmt.live && !held && (availableLive.indexOf(fmt.id) >= 0
                                   || fmt.id === "immersive"
                                   || fmt.id === "braille"
                                   || fmt.id === "ocr");
@@ -781,27 +877,24 @@
           var previewSuffix = (payload.job_status !== "published" && STATE.userRole === "Instructor") ? "?preview=1" : "";
           el.href = ORIGIN + "/canvas/panorama/alt/" + encodeURIComponent(payload.job_id || "") + "/" + fmt.id + previewSuffix;
           if (fmt.download) {
-            // ``download`` attribute on a same-origin link tells the
-            // browser to save the response without navigating. Leaving
-            // it empty defers the filename to the server's
-            // Content-Disposition header (set by the alt-format route).
             // No ``target="_blank"`` here — that would briefly open an
             // empty tab while the connector renders, which is what
             // faculty noticed and asked to fix.
-            el.setAttribute("download", "");
+            _wireDownload(el, el.href, fmt, filename, fmtStatus);
           } else {
             el.target = "_blank"; el.rel = "noopener";
           }
         }
       } else {
         el.setAttribute("aria-disabled", "true");
-        el.title = "Not yet enabled.";
+        el.title = held ? "Under development" : "Not available for this document";
       }
       el.innerHTML =
-        '<span class="reflow-pn-fmt-card-icon" style="background:' + fmt.color + '14;color:' + fmt.color + '">' +
+        '<span class="reflow-pn-fmt-card-icon" aria-hidden="true" style="background:' + fmt.color + '14;color:' + fmt.color + '">' +
         fmt.icon + '</span>' +
         '<span class="reflow-pn-fmt-card-label">' + esc(fmt.label) + '</span>' +
-        (enabled ? "" : '<span class="reflow-pn-fmt-card-soon">soon</span>');
+        (enabled ? "" : '<span class="reflow-pn-fmt-card-soon">' +
+          (held ? "Under development" : "Unavailable") + '</span>');
       return el;
     }
     FORMAT_GROUPS.forEach(function (group) {
@@ -818,6 +911,7 @@
       });
       grid.appendChild(section);
     });
+    grid.appendChild(fmtStatus);
 
     function close() { overlay.remove(); }
     overlay.addEventListener("click", function (e) { if (e.target === overlay) close(); });
@@ -1341,10 +1435,14 @@
       ".reflow-pn-fmt-card{display:flex;align-items:center;gap:0.7rem;padding:0.55rem 0.8rem;border:1px solid #e7e9ec;border-radius:8px;text-decoration:none;color:#1d1d1d;background:#fff;transition:border-color 120ms,transform 120ms,box-shadow 120ms;}",
       ".reflow-pn-fmt-card:hover{border-color:#bfc4cb;transform:translateY(-1px);box-shadow:0 4px 12px rgba(15,20,30,0.07);}",
       ".reflow-pn-fmt-card:focus-visible{outline:2px solid #0a5fb5;outline-offset:2px;border-color:#0a5fb5;}",
-      ".reflow-pn-fmt-card.is-disabled{opacity:0.45;cursor:not-allowed;pointer-events:none;}",
+      ".reflow-pn-fmt-card.is-disabled{cursor:not-allowed;pointer-events:none;background:#f7f7f8;color:#4b5563;}",
+      ".reflow-pn-fmt-card.is-disabled .reflow-pn-fmt-card-icon{filter:grayscale(1);opacity:0.55;}",
+      ".reflow-pn-fmt-card.is-busy{cursor:progress;border-color:#0a5fb5;}",
+      ".reflow-pn-fmt-card.is-busy .reflow-pn-fmt-card-label::after{content:' (preparing…)';font-weight:400;color:#4b5563;}",
+      ".reflow-pn-fmt-status{margin:0.6rem 0 0;font-size:0.85rem;color:#1f2937;min-height:1.2em;}",
       ".reflow-pn-fmt-card-icon{flex:0 0 auto;width:1.9rem;height:1.9rem;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:0.95rem;line-height:1;}",
       ".reflow-pn-fmt-card-label{flex:1;font-size:0.88rem;font-weight:500;line-height:1.25;}",
-      ".reflow-pn-fmt-card-soon{font-size:0.62rem;font-weight:700;text-transform:uppercase;color:#999;background:#f0f0f0;padding:0.12rem 0.4rem;border-radius:999px;}",
+      ".reflow-pn-fmt-card-soon{font-size:0.66rem;font-weight:700;color:#5c4400;background:#fff1c2;padding:0.12rem 0.45rem;border-radius:999px;white-space:nowrap;}",
       // WCAG publication gate panel (only shown when the backend returns
       // a 409 with structured findings). Inline inside the approval bar
       // so faculty stays in flow.
@@ -1365,12 +1463,6 @@
       ".reflow-pn-wcag-cancel{background:#fff;border-color:#cdd3da;color:#1d1d1d;}",
       ".reflow-pn-wcag-cancel:hover{background:#f3f4f6;}",
       ".reflow-pn-modal-footer{display:flex;align-items:center;justify-content:space-between;padding:0.7rem 1.5rem;border-top:1px solid #ececec;background:#fafafa;font-size:0.83rem;color:#444;}",
-      ".reflow-pn-switch{position:relative;display:inline-block;width:2.4rem;height:1.35rem;}",
-      ".reflow-pn-switch input{opacity:0;width:0;height:0;}",
-      ".reflow-pn-switch-slider{position:absolute;cursor:pointer;inset:0;background:#ccc;border-radius:999px;transition:background 160ms;}",
-      ".reflow-pn-switch-slider::before{content:'';position:absolute;left:0.15rem;top:0.15rem;width:1.05rem;height:1.05rem;background:#fff;border-radius:50%;transition:transform 160ms;}",
-      ".reflow-pn-switch input:checked + .reflow-pn-switch-slider{background:#2e7d32;}",
-      ".reflow-pn-switch input:checked + .reflow-pn-switch-slider::before{transform:translateX(1.05rem);}",
       // Editor
       ".reflow-pn-editor{position:fixed;inset:0;background:rgba(15,20,30,0.6);display:flex;align-items:center;justify-content:center;z-index:100000;font:14px system-ui,sans-serif;}",
       ".reflow-pn-editor-card{background:#fff;width:min(72rem,95vw);height:min(86vh,52rem);border-radius:10px;display:flex;flex-direction:column;box-shadow:0 30px 80px rgba(0,0,0,0.3);overflow:hidden;}",

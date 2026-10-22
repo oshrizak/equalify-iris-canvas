@@ -22,9 +22,14 @@ server. That makes them trivial to unit test and to call from workers.
 
 from __future__ import annotations
 
+import asyncio
+import html as _html
 import io
 import logging
+import os
 import re
+import threading
+import time
 import uuid
 
 from .iris_output import mathml_to_latex, strip_pagebreaks
@@ -33,6 +38,62 @@ from .markdown_to_html import RenderedPage, render
 logger = logging.getLogger(__name__)
 
 _MATHML_RE = re.compile(r"<math[\s>]", re.IGNORECASE)
+_H1_RE = re.compile(r"<h1[\s>][\s\S]*?</h1>", re.IGNORECASE)
+_EPUB_PATCH_LOCK = threading.Lock()
+_TAGS_RE = re.compile(r"<[^>]+>")
+
+
+def document_heading(rendered: RenderedPage) -> tuple[str, str]:
+    """``(page title, heading to add above the body)``.
+
+    A document that has its own ``<h1>`` keeps it as the only one, and its
+    text becomes the page title ("Week 1 Reading: The Water Cycle" rather
+    than the file name). One without gets the title as its ``<h1>``.
+    """
+    match = _H1_RE.search(rendered.html or "")
+    if match:
+        text = _html.unescape(_TAGS_RE.sub(" ", match.group(0)))
+        text = re.sub(r"\s+", " ", text).strip()
+        return (text or rendered.title or "Document"), ""
+    return rendered.title, f"<h1>{_escape(rendered.title)}</h1>"
+
+
+# ---- formats that need an outside service ----------------------------------
+
+def translation_configured() -> bool:
+    """The key :func:`render_translation` needs is set."""
+    return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+
+
+_AUDIO_CHECK_SECONDS = 600.0
+_audio_check: tuple[float, bool] | None = None
+
+
+def _aws_credentials_found() -> bool:
+    try:
+        import boto3
+    except ImportError:
+        return False
+    try:
+        return boto3.session.Session().get_credentials() is not None
+    except Exception:  # noqa: BLE001 - a broken AWS config is "no credentials"
+        return False
+
+
+async def audio_configured() -> bool:
+    """boto3 finds AWS credentials for Amazon Polly (:func:`render_audio_mp3`).
+
+    Cached for ten minutes: looking means asking the EC2 metadata endpoint
+    when nothing else has credentials, which takes a second where there is
+    none.
+    """
+    global _audio_check
+    now = time.monotonic()
+    if _audio_check is not None and now - _audio_check[0] < _AUDIO_CHECK_SECONDS:
+        return _audio_check[1]
+    found = await asyncio.to_thread(_aws_credentials_found)
+    _audio_check = (now, found)
+    return found
 
 
 # Anything between these markers (or these stand-alone forms) is math.
@@ -129,10 +190,11 @@ def html_full_document(rendered: RenderedPage, *, mathjax: bool | None = None) -
             '<script async="true" '
             'src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>'
         )
+    title, heading = document_heading(rendered)
     return (
         f"<!doctype html><html lang=\"{_lang(rendered)}\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"<title>{_escape(rendered.title)}</title>"
+        f"<title>{_escape(title)}</title>"
         "<style>body{font-family:Georgia,serif;max-width:48rem;margin:2rem auto;"
         "padding:0 1rem;line-height:1.65;color:#1d1d1d;}"
         "img{max-width:100%;height:auto;}"
@@ -140,7 +202,7 @@ def html_full_document(rendered: RenderedPage, *, mathjax: bool | None = None) -
         "th,td{border:1px solid #ccc;padding:0.5rem;text-align:left;}"
         "h1,h2,h3,h4{font-family:system-ui,sans-serif;}</style>"
         f"{head_extras}"
-        f"</head><body><h1>{_escape(rendered.title)}</h1>{rendered.html}</body></html>"
+        f"</head><body>{heading}{rendered.html}</body></html>"
     )
 
 
@@ -167,7 +229,6 @@ def render_epub(rendered: RenderedPage) -> bytes:
     """Convert the canonical HTML into an EPUB3 file."""
     try:
         from ebooklib import epub
-        from ebooklib import utils as _ebu
     except ImportError as exc:
         raise RuntimeError(
             "ebooklib is not installed; add 'ebooklib' to dependencies"
@@ -179,9 +240,18 @@ def render_epub(rendered: RenderedPage) -> bytes:
     # ``lxml.html.document_fromstring("")`` then raises "Document is empty",
     # surfacing as a 500 on the alt-format endpoint. Wrap ebooklib's
     # ``parse_html_string`` so an empty/whitespace body parses to an empty
-    # document instead of throwing. Restored in ``finally`` so the patch is
-    # scoped to this call and never leaks to other ebooklib users.
-    _orig_parse = _ebu.parse_html_string
+    # document instead of throwing. ``ebooklib.epub`` imported the function
+    # by name, so that is the name to patch (patching ``ebooklib.utils``
+    # alone changes nothing). Restored in ``finally`` so the patch is
+    # scoped to this call and never leaks to other ebooklib users; the lock
+    # keeps two renders in worker threads from saving each other's patch as
+    # the original.
+    with _EPUB_PATCH_LOCK:
+        return _render_epub_patched(epub, rendered)
+
+
+def _render_epub_patched(epub, rendered: RenderedPage) -> bytes:
+    _orig_parse = epub.parse_html_string
 
     def _safe_parse(s):
         is_empty = (
@@ -194,37 +264,40 @@ def render_epub(rendered: RenderedPage) -> bytes:
             return _lh.fromstring("<html><body></body></html>")
         return _orig_parse(s)
 
-    _ebu.parse_html_string = _safe_parse
+    epub.parse_html_string = _safe_parse
     try:
         return _build_epub(epub, rendered)
     finally:
-        _ebu.parse_html_string = _orig_parse
+        epub.parse_html_string = _orig_parse
 
 
 def _build_epub(epub, rendered: RenderedPage) -> bytes:
+    title, heading = document_heading(rendered)
     book = epub.EpubBook()
     book.set_identifier(f"accessible-document-{uuid.uuid4()}")
-    book.set_title(rendered.title or "Accessible Document")
+    book.set_title(title or "Accessible Document")
     book.set_language(_lang(rendered))
     # Both converters (Iris now, Reflow for older documents) are Equalify's.
     book.add_author("Equalify")
 
     chapter = epub.EpubHtml(
-        title=rendered.title or "Document",
+        title=title or "Document",
         file_name="content.xhtml",
         lang=_lang(rendered),
     )
+    # No XML declaration: ebooklib parses this string with lxml, which
+    # refuses a str that declares an encoding, and ebooklib answers that
+    # refusal by writing the chapter as an empty file. ebooklib writes its
+    # own declaration and namespaces around the body.
     chapter.content = (
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-        "<!DOCTYPE html><html xmlns=\"http://www.w3.org/1999/xhtml\" "
-        "xmlns:epub=\"http://www.idpf.org/2007/ops\"><head>"
-        f"<title>{_escape(rendered.title)}</title></head>"
-        f"<body><h1>{_escape(rendered.title)}</h1>{rendered.html}</body></html>"
+        "<html><head>"
+        f"<title>{_escape(title)}</title></head>"
+        f"<body>{heading}{rendered.html}</body></html>"
     )
     book.add_item(chapter)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.toc = (epub.Link("content.xhtml", rendered.title or "Document", "main"),)
+    book.toc = (epub.Link("content.xhtml", title or "Document", "main"),)
     book.spine = ["nav", chapter]
 
     buf = io.BytesIO()
@@ -594,7 +667,7 @@ def _strip_latex_delimiters(text: str) -> str:
 
 
 READER_TEMPLATE = """<!doctype html>
-<html lang=\"en\">
+<html lang=\"__RFLANG__\">
 <head>
 <meta charset=\"utf-8\">
 <title>__RFTITLE__ — Reader</title>
@@ -629,8 +702,8 @@ body.dark .toolbar button, body.dark .toolbar select {{ background: #2a2a2a; col
 <body>
 <div class=\"toolbar\" role=\"toolbar\" aria-label=\"Reader controls\">
   <span class=\"label\">Read aloud</span>
-  <button id=\"play\" aria-pressed=\"false\">▶ Play</button>
-  <button id=\"stop\">■ Stop</button>
+  <button id=\"play\" aria-pressed=\"false\"><span aria-hidden=\"true\">▶</span> Play</button>
+  <button id=\"stop\"><span aria-hidden=\"true\">■</span> Stop</button>
   <select id=\"voice\" aria-label=\"Voice\"></select>
   <select id=\"rate\" aria-label=\"Speed\">
     <option value=\"0.8\">0.8×</option><option value=\"1\" selected>1×</option>
@@ -645,7 +718,7 @@ body.dark .toolbar button, body.dark .toolbar select {{ background: #2a2a2a; col
   <button id=\"focus\" aria-pressed=\"false\" title=\"Highlight current line\">Focus</button>
 </div>
 <article id=\"content\">
-<h1>__RFTITLE__</h1>
+__RFHEADING__
 __RFBODY__
 </article>
 <script>
@@ -751,7 +824,18 @@ __RFBODY__
         if (Array.isArray(j) && j[0] && j[0].meanings && j[0].meanings[0]) {{
           var m = j[0].meanings[0];
           var def = (m.definitions && m.definitions[0] && m.definitions[0].definition) || '(no definition)';
-          pop.innerHTML = '<strong>' + word + '</strong> <em>(' + (m.partOfSpeech || '') + ')</em><br>' + def;
+          // Text only: the word is the reader's selection and the definition
+          // comes from a third party, so neither may become markup here.
+          var strong = document.createElement('strong');
+          strong.textContent = word;
+          var em = document.createElement('em');
+          em.textContent = '(' + (m.partOfSpeech || '') + ')';
+          pop.textContent = '';
+          pop.appendChild(strong);
+          pop.appendChild(document.createTextNode(' '));
+          pop.appendChild(em);
+          pop.appendChild(document.createElement('br'));
+          pop.appendChild(document.createTextNode(def));
         }} else {{
           pop.textContent = 'No definition found for "' + word + '".';
         }}
@@ -781,7 +865,10 @@ def render_reader_html(rendered: RenderedPage) -> str:
     # ("Single '{' encountered" / KeyError) — 500-ing the reader. So title and
     # body are no-field sentinels injected via str.replace(); .format() with no
     # args is used only to un-double the template's own braces.
+    title, heading = document_heading(rendered)
     page = READER_TEMPLATE.format()
-    page = page.replace("__RFTITLE__", _escape(rendered.title or "Document"))
+    page = page.replace("__RFLANG__", _lang(rendered))
+    page = page.replace("__RFTITLE__", _escape(title or "Document"))
+    page = page.replace("__RFHEADING__", heading)
     page = page.replace("__RFBODY__", rendered.html or "")
     return page

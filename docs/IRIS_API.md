@@ -175,14 +175,34 @@ was their correction, not Iris's output. 409 (already closed) and 410
 (expired) are ignored, and it runs off the request path, so approval never
 waits on Iris.
 
+### `POST /v1/sessions/{id}/pdf` (optional in Iris)
+
+"Searchable PDF". Iris hands back the PDF the session was made from,
+tagged from its HTML by equalify-iris-pdf: `{"filename", "pdf" (base64),
+"report"}`. The connector sends `{}` (no form values: the format is the
+document as published) and asks only when `GET /v1/limits` says
+`tagged_pdf: true`, the session is `ready_for_review` or `closed`, and
+faculty did not edit the document. Iris tags two PDFs at a time and answers
+a third with `503 busy` and `Retry-After`; the connector waits (at most 15
+seconds a time) and asks again, up to four times. A part at a time, never
+two at once, and one run per document however many students ask together.
+
+The connector keeps the result (see `IRIS_TAGGED_PDF_DIR`), so each document
+is tagged once. `404 tagged_pdf_unavailable`, `404 session_not_found`, `410
+session_expired`, `409 no_source_pdf` (a session made from images or several
+files), `422` (a PDF the tagger refuses, such as an encrypted one) and `504
+timeout` all mean the connector renders its own PDF instead, and logs why.
+
 ## Retention on the Iris side
 
 Iris keeps every session's uploaded PDF, page images and output under
 `data/sessions/<id>/` **until `storage.session_retention_days` deletes
 them; blank (the default) keeps them forever.** The connector stores its
-own copy of each finished document and never reads a session again after
-it completes, so a short retention (for example 30 days) costs nothing. Set
-it on any Iris that converts course documents.
+own copy of each finished document, and asks for a document's tagged PDF
+when faculty approve it and keeps that too, so a short retention (for
+example 30 days) costs little: a document whose sessions expire before
+anyone approved it or asked for its "Searchable PDF" gets the connector's
+own PDF for that format. Set it on any Iris that converts course documents.
 
 ## Long documents
 
@@ -237,9 +257,9 @@ Deliberately not used:
   never needs the deployment-wide list.
 - `POST /v1/sessions/{id}/feedback` — re-running with feedback. Faculty edit
   the HTML in the connector instead. A natural follow-up for "Request edits".
-- `GET /v1/sessions/{id}/fields`, `POST /v1/sessions/{id}/pdf` — the optional
-  tagged-PDF route (needs `equalify-iris-pdf`). The connector's own tagged PDF
-  (WeasyPrint) is still used.
+- `GET /v1/sessions/{id}/fields` — form fields, for filling a form in. The
+  "Searchable PDF" format is the document as published, so no values are
+  ever sent.
 - `GET /v1/sessions/{id}/logs`, `/v1/stats`, `/v1/quality`, `/v1/suggestions`.
 
 ## What Iris does not do that Reflow did

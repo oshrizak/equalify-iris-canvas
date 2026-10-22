@@ -93,6 +93,9 @@ _MATH_RUN_RE = re.compile(
 # ``[Page 214]`` markers, the convention the production manual uses for
 # print page numbers placed inline in the text.
 _PRINT_PAGE_RE = re.compile(r"\[\s*Page\s+([0-9ivxlcdm]+)\s*\]", re.IGNORECASE)
+# A document with its own top-level heading is not given the file name as a
+# second one.
+_H1_RE = re.compile(r"<h1[\s>]", re.IGNORECASE)
 
 # Where liblouis keeps its tables on Debian/Ubuntu images.
 _TABLE_DIRS = (
@@ -410,7 +413,8 @@ def build_blocks(rendered: RenderedPage) -> list[Block]:
     builder.feed(_braille_ready_html(rendered))
     builder.close()
     title = (rendered.title or "").strip()
-    head = [Block(kind="heading", level=1, runs=[Run(text=title)])] if title else []
+    has_own = bool(_H1_RE.search(rendered.html or ""))
+    head = [Block(kind="heading", level=1, runs=[Run(text=title)])] if title and not has_own else []
     return head + builder.blocks
 
 
@@ -426,11 +430,12 @@ def build_braille_xml(rendered: RenderedPage) -> str:
     builder.close()
     body = "".join(builder.parts).strip()
     title = html_module.escape(rendered.title or "Untitled document")
+    heading = "" if _H1_RE.search(rendered.html or "") else f"<h1>{title}</h1>"
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">\n'
         f"<head><title>{title}</title></head>\n"
-        f"<body><h1>{title}</h1>\n{body}\n</body>\n</html>\n"
+        f"<body>{heading}\n{body}\n</body>\n</html>\n"
     )
 
 

@@ -85,11 +85,10 @@ endpoints the connector consumes.
 | HTML with math | + MathJax (mhchem extension) | Iris writes MathML (with the LaTeX in `alttext`); legacy Reflow documents carry LaTeX, rendered at view time |
 | Plain text | tag-strip | UTF-8, no markup |
 | Markdown | markdownify | Derived from the canonical HTML; math as `$...$`, print pages as `[Page N]` |
-| Tagged PDF | WeasyPrint (pdf/ua-1) | Born-digital input: produces a real structure tree (`StructTreeRoot`, `MarkInfo`, language metadata). Image-only input: falls back to ocrmypdf. Math renders as inline SVG via matplotlib's mathtext so equations are visible in the PDF and the LaTeX source is preserved as the figure `alt` for screen readers. |
-| Searchable PDF | ocrmypdf | Image-only scans get an OCR text layer |
+| Searchable PDF | Iris's tagged PDF (`equalify-iris-pdf`) | The original file, page for page, with a structure tree and a text layer built from Iris's HTML; scans included. A document Iris converted in parts is tagged part by part and joined. Made when faculty approve the document and kept on the connector's `connector-data` volume. When Iris cannot tag it, or faculty edited the document (Iris cannot see their edits): WeasyPrint (pdf/ua-1) renders the accessible HTML, or for an untouched scan ocrmypdf adds a text layer. |
 | ePub | ebooklib | EPUB3 |
-| Audio (MP3) | Amazon Polly | Requires `AWS_DEFAULT_REGION` + IAM credentials with `polly:SynthesizeSpeech` |
-| Translate | Anthropic Claude (Sonnet 4.5) | Requires `ANTHROPIC_API_KEY`. Prompt explicitly preserves LaTeX math and `\ce{}` chemistry markup verbatim. |
+| Audio (MP3) | Amazon Polly | Requires `AWS_DEFAULT_REGION` + IAM credentials with `polly:SynthesizeSpeech`. Without them the menu shows it as under development. |
+| Translate | Anthropic Claude (Sonnet 4.5) | Requires `ANTHROPIC_API_KEY`; without it the menu shows it as under development. Prompt explicitly preserves LaTeX math and `\ce{}` chemistry markup verbatim. |
 | Braille (BRF) | liblouis (`lou_translate`) + in-house BANA layout | Structured transcription, not flat text: UEB contracted braille for prose, with a maths code (Nemeth where available, otherwise UEB Technical) applied *only* to expressions. Centred headings, 3-1 paragraphs, 1-3 lists, figure descriptions with the caption first, print page numbers, 40×25 pages with form feeds, words never split. See [`docs/BRAILLE.md`](docs/BRAILLE.md). |
 
 ### Behind the scenes

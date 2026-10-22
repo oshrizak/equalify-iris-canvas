@@ -587,6 +587,21 @@ def content_keys(job_id: str) -> list[str]:
     ]
 
 
+def forget_job_files(job_id: str) -> None:
+    """Delete what the connector keeps on disk for a job: the tagged PDF
+    Iris made for its "Searchable PDF" (see ``tagged_pdf_store``).
+
+    Every path that deletes :func:`content_keys` calls this too, so a
+    purged, expired or erased document leaves no copy behind.
+    """
+    from .tagged_pdf_store import forget
+
+    try:
+        forget(job_id)
+    except Exception:  # noqa: BLE001 - a purge goes on regardless
+        logger.exception("Could not delete the stored files of job %s", job_id)
+
+
 async def get_file_page(redis: Redis, course_id: str, file_id: str) -> str | None:
     """Return the wiki page slug previously created for this Canvas file."""
     raw: Any = await redis.get(
@@ -640,6 +655,7 @@ async def purge_job(redis: Redis, job: CanvasJob) -> None:
     await redis.srem(PENDING_KEY.format(course_id=course), job.reflow_job_id)
     for key in content_keys(job.reflow_job_id):
         await redis.delete(key)
+    forget_job_files(job.reflow_job_id)
     # A re-upload of the same bytes must convert again rather than alias
     # onto the record that was just removed.
     await forget_hash_pointer(redis, job)
@@ -962,6 +978,7 @@ async def purge_old_canvas_records(
                 # at their own keys; drop them too.
                 for content_key in content_keys(job_id):
                     await redis.delete(content_key)
+                forget_job_files(job_id)
                 # Without this, the same file uploaded again would alias
                 # onto the deleted job and never be converted.
                 await forget_hash_pointer(redis, job)

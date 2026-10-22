@@ -8,6 +8,7 @@ import logging
 import time
 from dataclasses import asdict
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Cookie, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import (
@@ -21,14 +22,18 @@ from pydantic import BaseModel
 from redis.asyncio import Redis
 
 from ..canvas.alt_formats import (
+    audio_configured,
     html_full_document,
     html_to_plain_text,
+    pdf_has_text_layer,
     render_audio_mp3,
     render_braille_brf,
     render_epub,
     render_ocr_pdf,
     render_reader_html,
+    render_tagged_pdf,
     render_translation,
+    translation_configured,
 )
 from ..canvas.content import (
     ContentUnavailableError,
@@ -78,6 +83,22 @@ SCORE_CACHE_TTL = 24 * 3600
 # Every format we can currently deliver. Source of truth shared with the
 # bundle's modal. Translation is parameterised (e.g. ``translate:es``).
 LIVE_FORMATS = ["html", "html-math", "txt", "markdown", "epub", "audio", "translate", "ocr", "immersive", "braille"]
+
+# Audio needs Amazon Polly credentials and translation an Anthropic key. A
+# deployment without them lists those formats as under development: the
+# overlay shows them that way instead of offering a link that fails, and
+# their URLs say the same thing. They switch on once the service is set up.
+_UNDER_DEVELOPMENT = "This format is under development."
+
+
+async def format_availability() -> tuple[list[str], list[str]]:
+    """``(available formats, formats under development)`` on this deployment."""
+    held: list[str] = []
+    if not await audio_configured():
+        held.append("audio")
+    if not translation_configured():
+        held.append("translate")
+    return [f for f in LIVE_FORMATS if f not in held], held
 
 
 @router.get("/handshake")
@@ -590,7 +611,15 @@ async def alt_format(
     # Markdown bypasses HTML — it's a separate pivot for power users.
     if fmt == "markdown":
         markdown = await _fetch_markdown(redis, job_id)
-        return PlainTextResponse(markdown, media_type="text/markdown")
+        return PlainTextResponse(
+            markdown, media_type="text/markdown", headers=_attachment(job, "md"),
+        )
+
+    # "Searchable PDF": Iris's tagged copy of the original when it can make
+    # one, which needs no HTML here. ``pdf-tagged`` stays as an alias for
+    # links people saved.
+    if fmt in ("ocr", "pdf-tagged"):
+        return await _searchable_pdf(redis, job, request)
 
     # All other formats derive from canonical or edited HTML.
     rendered = await _resolve_html(redis, job_id)
@@ -600,98 +629,37 @@ async def alt_format(
     if fmt == "html-math":
         return HTMLResponse(html_full_document(rendered, mathjax=True))
     if fmt == "txt":
-        return PlainTextResponse(html_to_plain_text(rendered))
+        # An attachment, so the overlay's link downloads it instead of
+        # taking the Canvas tab to a page of plain text.
+        return PlainTextResponse(html_to_plain_text(rendered), headers=_attachment(job, "txt"))
     if fmt == "epub":
         try:
-            data = render_epub(rendered)
+            data = await asyncio.to_thread(render_epub, rendered)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return Response(
-            data,
-            media_type="application/epub+zip",
-            headers={"Content-Disposition": f"attachment; filename=\"{_safe(job.canvas_file_name)}.epub\""},
-        )
+        return Response(data, media_type="application/epub+zip", headers=_attachment(job, "epub"))
     if fmt == "audio":
+        if not await audio_configured():
+            raise HTTPException(status_code=404, detail=_UNDER_DEVELOPMENT)
         try:
-            audio = render_audio_mp3(rendered)
+            audio = await asyncio.to_thread(render_audio_mp3, rendered)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return Response(audio, media_type="audio/mpeg",
-                        headers={"Content-Disposition": f"attachment; filename=\"{_safe(job.canvas_file_name)}.mp3\""})
+        return Response(audio, media_type="audio/mpeg", headers=_attachment(job, "mp3"))
     if fmt == "immersive":
         # Immersive-Reader-style standalone HTML using browser Web Speech API.
         return HTMLResponse(render_reader_html(rendered))
 
     if fmt == "braille":
         try:
-            brf = render_braille_brf(rendered)
+            brf = await asyncio.to_thread(render_braille_brf, rendered)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return Response(
-            brf,
-            media_type="application/x-brf",
-            headers={"Content-Disposition": f"attachment; filename=\"{_safe(job.canvas_file_name)}.brf\""},
-        )
-
-    if fmt == "ocr" or fmt == "pdf-tagged":
-        # "Searchable PDF" is a slightly misleading legacy name — the
-        # endpoint produces an accessible PDF using whichever tool is
-        # right for the input:
-        #   * Image-only scan -> ocrmypdf adds a text layer (still no
-        #     structure tree, but at least it's searchable).
-        #   * Born-digital (text already present) -> WeasyPrint renders
-        #     the canonical accessible HTML into a tagged PDF with
-        #     headings, reading order, and alt text. Running ocrmypdf
-        #     against this input is a no-op (the output is the input
-        #     back), so the Tagged path is the real accessibility win.
-        # ``pdf-tagged`` stays as an alias for cached links.
-        if not job.canvas_file_id:
-            raise HTTPException(status_code=409, detail="No source file id on job")
-        from ..workers.reflow_bridge_worker import _canvas_client_for_job
-        canvas = await _canvas_client_for_job(redis, job)
-        try:
-            pdf_bytes = await canvas.download_file(str(job.canvas_file_id))
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Could not fetch source PDF: {exc}") from exc
-
-        from ..canvas.alt_formats import pdf_has_text_layer, render_tagged_pdf
-
-        if pdf_has_text_layer(pdf_bytes):
-            # Born-digital. Render the accessible HTML to a tagged PDF.
-            # Pass a base_url so relative figure refs in the rendered
-            # HTML resolve against the same alt-route the connector
-            # already serves figures from.
-            scheme = request.url.scheme
-            host = request.url.netloc
-            base_url = f"{scheme}://{host}/canvas/panorama/alt/{job_id}/"
-            try:
-                tagged = render_tagged_pdf(rendered, base_url=base_url)
-            except RuntimeError as exc:
-                raise HTTPException(status_code=503, detail=str(exc)) from exc
-            return Response(
-                tagged,
-                media_type="application/pdf",
-                headers={
-                    "Content-Disposition":
-                    f"attachment; filename=\"{_safe(job.canvas_file_name)}.tagged.pdf\"",
-                },
-            )
-
-        # Image-only scan. ocrmypdf adds a text layer. Output is
-        # searchable; it's not PDF/UA-tagged but it's the best we can
-        # do without the canonical HTML to derive structure from
-        # (which doesn't exist for scan-only inputs).
-        try:
-            ocr_pdf = render_ocr_pdf(pdf_bytes, archival=True)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return Response(
-            ocr_pdf,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=\"{_safe(job.canvas_file_name)}.searchable.pdf\""},
-        )
+        return Response(brf, media_type="application/x-brf", headers=_attachment(job, "brf"))
 
     if fmt.startswith("translate:"):
+        if not translation_configured():
+            raise HTTPException(status_code=404, detail=_UNDER_DEVELOPMENT)
         lang = fmt.split(":", 1)[1] or "es"
         try:
             translated = await render_translation(rendered, lang)
@@ -700,6 +668,96 @@ async def alt_format(
         return HTMLResponse(html_full_document(translated))
 
     raise HTTPException(status_code=404, detail=f"Format not available: {fmt}")
+
+
+async def _searchable_pdf(redis: Redis, job: Any, request: Request) -> Response:
+    """The "Searchable PDF" format.
+
+    For an Iris document faculty did not edit: Iris's tagged copy of the
+    original, the same pages with a structure tree and a text layer (see
+    ``connector.canvas.iris_tagged_pdf``). Iris tags from its own HTML, so a
+    document faculty edited, one Iris cannot tag, and a Reflow-era document
+    get the connector's own PDF instead (:func:`_connector_pdf`).
+    """
+    from ..canvas import iris_tagged_pdf
+
+    job_id = job.reflow_job_id
+    edited = bool(await get_edited_html(redis, job_id))
+    if job.is_iris and not edited and iris_tagged_pdf.enabled():
+        try:
+            made = await iris_tagged_pdf.iris_tagged_pdf(job)
+        except iris_tagged_pdf.TaggedPdfUnavailable as exc:
+            logger.info("Searchable PDF for %s is the connector's own: %s", job_id, exc.reason)
+        except Exception:  # noqa: BLE001 - a student still gets a PDF
+            logger.exception("Searchable PDF for %s: Iris's tagged PDF failed", job_id)
+        else:
+            return Response(
+                made.pdf, media_type="application/pdf",
+                headers={
+                    **_attachment(job, "pdf", name=made.filename),
+                    "X-Accessible-Pdf": "iris-tagged",
+                },
+            )
+    return await _connector_pdf(redis, job, request, edited=edited)
+
+
+async def _connector_pdf(redis: Redis, job: Any, request: Request, *, edited: bool) -> Response:
+    """The connector's own PDF, when Iris's tagged copy is not to be had.
+
+    * Edited by faculty: the edited HTML rendered by WeasyPrint into a tagged
+      PDF, so their corrections reach students.
+    * Otherwise, by the source: a born-digital file gets the same rendering
+      of the accessible HTML (ocrmypdf would hand it back unchanged); an
+      image-only scan gets a text layer from ocrmypdf, searchable but not
+      tagged.
+    """
+    job_id = job.reflow_job_id
+    rendered = await _resolve_html(redis, job_id)
+    base_url = f"{request.url.scheme}://{request.url.netloc}/canvas/panorama/alt/{job_id}/"
+
+    async def tagged_from_html(label: str) -> Response:
+        try:
+            pdf = await asyncio.to_thread(render_tagged_pdf, rendered, base_url=base_url)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return Response(
+            pdf, media_type="application/pdf",
+            headers={**_attachment(job, "pdf", suffix="tagged"), "X-Accessible-Pdf": label},
+        )
+
+    if edited:
+        return await tagged_from_html("connector-edited")
+    if not job.canvas_file_id:
+        raise HTTPException(status_code=409, detail="No source file id on job")
+    from ..workers.reflow_bridge_worker import _canvas_client_for_job
+
+    canvas = await _canvas_client_for_job(redis, job)
+    try:
+        source = await canvas.download_file(str(job.canvas_file_id))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch source PDF: {exc}") from exc
+    from ..canvas.iris_documents import DocumentPrepError, is_office_document, office_to_pdf
+
+    if is_office_document(job.canvas_file_name):
+        try:
+            source = await asyncio.to_thread(office_to_pdf, job.canvas_file_name, source)
+        except DocumentPrepError:
+            # No LibreOffice here: the accessible HTML still makes a PDF.
+            return await tagged_from_html("connector-html")
+    try:
+        has_text = await asyncio.to_thread(pdf_has_text_layer, source)
+    except Exception:  # noqa: BLE001 - not a PDF this can read; the HTML still is one
+        has_text = True
+    if has_text:
+        return await tagged_from_html("connector-html")
+    try:
+        ocr_pdf = await asyncio.to_thread(render_ocr_pdf, source, archival=True)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(
+        ocr_pdf, media_type="application/pdf",
+        headers={**_attachment(job, "pdf", suffix="searchable"), "X-Accessible-Pdf": "connector-ocr"},
+    )
 
 
 # ---- Helpers -------------------------------------------------------------
@@ -724,18 +782,21 @@ async def _build_score_payload(redis: Redis, job_id: str) -> dict[str, Any]:
             # the front-end to render the approval bar / DRAFT badge. The
             # approval flow only depends on job.status, not on the score.
             fallback_job = await get_job(redis, job_id)
+            available, held = await format_availability()
             fb = {
                 "status": "processing",
                 "job_id": job_id,
-                "available_formats": list(LIVE_FORMATS),
+                "available_formats": available,
+                "under_development": held,
                 "job_status": fallback_job.status if fallback_job else "processing",
             }
             if fallback_job is not None and getattr(fallback_job, "error", None):
                 fb["error"] = fallback_job.error
             return fb
-    # Always overwrite available_formats from the live LIVE_FORMATS list so
-    # new format renderers light up as soon as they're added server-side.
-    payload["available_formats"] = list(LIVE_FORMATS)
+    # Always overwrite available_formats from the live list so new format
+    # renderers light up as soon as they're added server-side, and formats
+    # whose service is not set up show as under development.
+    payload["available_formats"], payload["under_development"] = await format_availability()
     # Respect ``score_from_reflow_result``'s status ("scored" vs
     # "unscanned"); the previous unconditional override forced every
     # row to "scored" and contributed to the misleading flat-15 display.
@@ -1100,11 +1161,23 @@ async def _resolve_html(redis: Redis, job_id: str) -> RenderedPage:
     return await _build_canonical_html(redis, job_id)
 
 
-def _safe(name: str | None) -> str:
-    """Sanitize for Content-Disposition filename headers."""
+def _attachment(job: Any, ext: str, *, suffix: str = "", name: str | None = None) -> dict[str, str]:
+    """``Content-Disposition`` for a download of ``job`` as ``.ext``.
+
+    The file is named after the document (``Week 3.epub``, not
+    ``Week 3.pdf.epub``). Header values are Latin-1, so the plain
+    ``filename`` is ASCII and the real name rides in ``filename*``.
+    """
     if not name:
-        return "document"
-    return "".join(c if c.isalnum() or c in "-._ " else "_" for c in name).strip()
+        name = title_for(job) + (f".{suffix}" if suffix else "") + f".{ext}"
+    ascii_name = "".join(
+        c if (c.isascii() and (c.isalnum() or c in "-._ ()")) else "_" for c in name
+    ).strip() or f"document.{ext}"
+    return {
+        "Content-Disposition": (
+            f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1135,6 +1208,20 @@ async def maybe_close_iris_sessions(redis: Redis, job: Any) -> None:
     task = asyncio.create_task(close_sessions(IrisClient(), job))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+async def maybe_make_tagged_pdf(redis: Redis, job: Any) -> None:
+    """On approval, have Iris tag the document in the background, so the
+    first student to ask for "Searchable PDF" gets it at once. Not for an
+    edited document: Iris cannot see the edits, so that one gets the
+    connector's own PDF."""
+    if not getattr(job, "is_iris", False):
+        return
+    if await get_edited_html(redis, job.reflow_job_id):
+        return
+    from ..canvas.iris_tagged_pdf import warm_tagged_pdf
+
+    warm_tagged_pdf(job)
 
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +1754,7 @@ async def approve_job(
         except Exception:  # noqa: BLE001 — page publish is best-effort
             logger.exception("approve_job: could not publish Canvas page for %s", job_id)
     await maybe_close_iris_sessions(redis, job)
+    await maybe_make_tagged_pdf(redis, job)
     await append_approval_event(
         redis,
         job_id=job_id,
@@ -1888,6 +1976,7 @@ async def approve_bulk(
         job.status = "published"
         await put_job(redis, job)
         await maybe_close_iris_sessions(redis, job)
+        await maybe_make_tagged_pdf(redis, job)
         await append_approval_event(
             redis,
             job_id=jid,

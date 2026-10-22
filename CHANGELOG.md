@@ -37,6 +37,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already has the Reflow-named folders keeps using them and gets no second
   folder, and the review page names the drop folder the course actually has.
 
+### Changed: "Searchable PDF" is Iris's tagged PDF
+
+- **"Searchable PDF" hands students the original document, tagged by Iris**
+  (`POST /v1/sessions/{id}/pdf`, equalify-iris-pdf): the same pages, looking
+  as they did, with a structure tree a screen reader follows and a text
+  layer search finds, scans included. It used to be a re-typeset copy of
+  the accessible HTML. A document Iris converted in parts is tagged part by
+  part and joined into one tagged PDF (`connector/canvas/pdf_merge.py`).
+- **Approving a document makes its tagged PDF in the background**, and the
+  connector keeps it on a new `connector-data` volume (`IRIS_TAGGED_PDF_DIR`,
+  mounted at `/app/data`), so students get it at once and it outlives Iris's
+  session retention. A class asking for the same document at once shares one
+  Iris run. Deleting, purging or erasing a job deletes its file.
+- **A document faculty edited still gets the connector's own PDF**, made
+  from their edits: Iris tags from its own HTML and cannot see them. So does
+  a document Iris cannot tag (an Iris without the tagger, a session it no
+  longer has, a PDF it refuses); the log says why. `IRIS_TAGGED_PDF=false`
+  turns the Iris path off. The response header `X-Accessible-Pdf` names the
+  source.
+- **Upgrading:** `docker compose up -d` creates the volume; nothing else to
+  do. Documents approved before the upgrade get their tagged PDF the first
+  time someone asks.
+
+### Fixed: the Alternative Formats Menu
+
+- **ePub downloads had an empty chapter.** ebooklib refused the chapter
+  text (it began with an XML declaration naming an encoding) and wrote the
+  chapter as an empty file, so every ePub was blank. The workaround meant to
+  protect ePub writing patched a name ebooklib no longer reads; it now
+  patches the one it does.
+- **Plain text and Markdown downloads** are now attachments: the menu's
+  links pointed at the connector, another site than Canvas, where browsers
+  ignore a link's `download` attribute, so the Canvas tab was replaced by
+  raw text. The menu now fetches every download itself, keeps the person on
+  the page, says "Preparing…" while it waits, and explains a failure in
+  words instead of showing an error page.
+- **Audio (MP3) and Translate show as "under development"** until Amazon
+  Polly credentials or an Anthropic key are set up, instead of offering a
+  link that answered with an operator's error message. Their URLs answer 404
+  with the same words, and the formats switch on by themselves once their
+  service is configured.
+- **One H1 per document.** Accessible HTML, HTML with math, the Immersive
+  Reader, ePub and Braille put the file name above the document as a second
+  top-level heading; a document with its own H1 now keeps it as the only
+  one, and its text becomes the page title. The Immersive Reader declares
+  the document's language instead of always English.
+- **The menu's footer toggle is gone.** It controlled nothing and had no
+  label for screen readers. Format icons are hidden from screen readers so
+  each card reads as its name, and unavailable cards stay legible.
+- **Download file names** are the document's name (`Week 3.epub`, not
+  `Week 3.pdf.epub`), and a name outside Latin-1 no longer breaks the
+  download.
+- **The Immersive Reader's dictionary popup** builds its text with DOM
+  nodes: it used to insert the selected word and a third-party definition
+  as HTML.
+- **ePub, audio, braille and the connector's own PDFs render off the event
+  loop**, so a slow render no longer stalls every other request.
+
 ### Fixed
 
 - **A figure upload refused with 429 or 503 by Canvas's file storage** now

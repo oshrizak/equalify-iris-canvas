@@ -129,7 +129,8 @@ LOG_LEVEL=INFO
 ENVIRONMENT=production
 ```
 
-Optional, only when the matching alt-format is enabled:
+Optional. Without them the menu shows Audio and Translate as under
+development:
 
 ```
 # Audio (MP3) — Amazon Polly
@@ -176,8 +177,11 @@ CANVAS_TENANT=<short slug, e.g. "csueb" or "uchicago">
 ## Persistence + backups
 
 `docker-compose.yml` runs Redis with AOF + RDB persistence on a named
-volume (`redis-data`). The volume survives `docker compose down`;
-`docker compose down -v` wipes it.
+volume (`redis-data`), and keeps the tagged PDFs Iris made for "Searchable
+PDF" on a second one (`connector-data`, mounted at `/app/data`). Both
+survive `docker compose down`; `docker compose down -v` wipes them. The
+tagged PDFs need no backup while Iris still has the sessions: a lost one is
+made again on the next request.
 
 Schedule the bundled backup script from host cron for off-host
 durability:

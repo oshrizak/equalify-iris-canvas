@@ -208,7 +208,7 @@ async def delete_job_and_derivatives(redis: Any, *, reflow_job_id: str) -> dict[
     # state derived from it. Counted separately so the audit line says the
     # content went too, not only the record pointing at it. The edited HTML
     # and score cache are counted on their own below.
-    from ..canvas.state import content_keys, forget_job_pointers, get_job
+    from ..canvas.state import content_keys, forget_job_files, forget_job_pointers, get_job
 
     try:
         record = await get_job(redis, reflow_job_id)
@@ -223,6 +223,7 @@ async def delete_job_and_derivatives(redis: Any, *, reflow_job_id: str) -> dict[
             deleted["converted_content"] += int(await redis.delete(content_key) or 0)
         except Exception:
             logger.exception("delete_job: redis.delete failed on %s", content_key)
+    forget_job_files(reflow_job_id)
     keys_to_remove = [
         tk(f"canvas:job:{reflow_job_id}"),
         f"eq-pdf:job:{reflow_job_id}",

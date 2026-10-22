@@ -29,6 +29,10 @@ services:
       IRIS_API_BASE_URL: ${IRIS_API_BASE_URL:-http://host.docker.internal:8080}
     volumes:
       - ./keys:/app/keys:ro
+      # Tagged PDFs Iris made for "Searchable PDF" (IRIS_TAGGED_PDF_DIR),
+      # kept across rebuilds so each is made once and outlives Iris's
+      # session retention.
+      - connector-data:/app/data
     depends_on:
       redis:
         condition: service_healthy
@@ -73,3 +77,5 @@ volumes:
   # Redis AOF + RDB files. Survive ``docker compose down`` and image
   # rebuilds. ``docker compose down -v`` is required to wipe.
   redis-data:
+  # Files the connector keeps (tagged PDFs). Same lifetime as redis-data.
+  connector-data:

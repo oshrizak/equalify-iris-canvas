@@ -81,7 +81,8 @@ Three things matter more than anything else here:
 - **Set a session retention.** Iris keeps each session's PDF, page images
   and output until `storage.session_retention_days` deletes them, and
   forever while it is blank (the default). The connector keeps its own copy
-  of every finished document, so a short retention costs nothing. Copy
+  of every finished document, and of each approved document's tagged PDF,
+  so a short retention costs little. Copy
   `config.example.yaml` to `config.yaml`, set
   `storage.session_retention_days: 30` (or your records policy's number),
   and mount it as Iris's compose file shows.

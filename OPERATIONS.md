@@ -169,7 +169,9 @@ external service that sees document content is listed below.
 The connector itself stores in Redis: instructor OAuth tokens
 (encrypted at rest), approval audit log records, document state, the
 converted document of every Iris job, and a short-lived cache of PDF
-bytes during figure-proxy responses. Word and PowerPoint files are turned
+bytes during figure-proxy responses. On the `connector-data` volume it
+keeps each approved document's tagged PDF from Iris (the original document
+with tags); deleting, purging or erasing a job deletes it too. Word and PowerPoint files are turned
 into PDFs inside the connector's own container (LibreOffice); no external
 service sees them before Iris does.
 
@@ -182,8 +184,8 @@ instructor whose Canvas token the watcher uses) accepts version 2.0, and
 "Try again" requires the instructor clicking it to have accepted it.
 
 To leave **Translate** and **Audio MP3** off entirely, simply don't set
-`ANTHROPIC_API_KEY` and `AWS_ACCESS_KEY_ID`. The buttons stay in the
-modal and return clean 503s with setup instructions — no document
+`ANTHROPIC_API_KEY` and `AWS_ACCESS_KEY_ID`. The menu shows them as under
+development and their URLs answer 404 with the same words — no document
 content ever leaves the connector.
 
 ## Operator tools (`python -m connector.tools.*`)
@@ -322,14 +324,18 @@ renamed the file), the dial won't attach. Check
 the stored `canvas_file_name` and compare to what the panorama
 overlay sees on the page.
 
-### Searchable PDF takes a long time and the row dial flickers
+### Searchable PDF takes a long time
 
-WeasyPrint + matplotlib + PyMuPDF all run synchronously in the request
-handler. A textbook chapter with 50+ figures and equations can take
-20–40 seconds. Acceptable; the click downloads in-place (no blank
-tab) so faculty sees the browser's download indicator immediately.
-Consider moving to a background-job queue if 95p latency becomes a
-problem.
+The first request for a document asks Iris to tag it, part by part: a few
+seconds for a short born-digital PDF, a minute or more for 25 scanned
+pages (Iris runs Tesseract to place the words). Approving a document makes
+it in the background, so students normally get the kept copy at once. The
+menu says "Preparing Searchable PDF…" while it waits and announces the
+download or the reason it failed. The response header `X-Accessible-Pdf`
+says which PDF was served: `iris-tagged`, or the connector's own
+(`connector-edited`, `connector-html`, `connector-ocr`); the log line
+"Searchable PDF for <job> is the connector's own: <reason>" says why Iris's
+was not.
 
 ### Audit log too big
 
