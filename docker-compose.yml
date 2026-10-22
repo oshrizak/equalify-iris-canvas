@@ -1,0 +1,75 @@
+services:
+  connector:
+    build: .
+    image: equalify-iris-canvas:dev
+    # ``--proxy-headers`` makes uvicorn trust X-Forwarded-Proto / -For from the
+    # fronting proxy (cloudflared / a real LB), so request.base_url comes back
+    # as https://... when traffic enters over HTTPS. Without this the LTI
+    # config endpoint hands Canvas http:// URLs and the launch is rejected.
+    command:
+      - uvicorn
+      - connector.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # Reach Equalify Iris on the host machine by default (Iris's own
+      # compose file publishes 8080 on every interface). In production put
+      # both on one Docker network instead, publish no public Iris port, and
+      # set IRIS_API_BASE_URL in .env, e.g. http://iris:8080.
+      IRIS_API_BASE_URL: ${IRIS_API_BASE_URL:-http://host.docker.internal:8080}
+    volumes:
+      - ./keys:/app/keys:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # No host port binding — the connector reaches redis via the compose
+    # network at ``redis:6379``. Avoids colliding with other Redis containers
+    # an operator may already have on 6379.
+    #
+    # Persistence: AOF (every write fsync'd ~1s) + RDB snapshots (default
+    # save points). Without these, a container restart wipes every
+    # CanvasJob, instructor OAuth token, approval audit log entry, and
+    # pending-review set — i.e. all faculty consent and accessibility
+    # decisions ever made. Mount the data dir to a named volume so the
+    # AOF/RDB files survive container lifecycle.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "900 1"
+      - --save
+      - "300 10"
+      - --save
+      - "60 10000"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  # Redis AOF + RDB files. Survive ``docker compose down`` and image
+  # rebuilds. ``docker compose down -v`` is required to wipe.
+  redis-data:

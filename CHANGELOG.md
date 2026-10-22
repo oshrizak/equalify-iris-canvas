@@ -1,0 +1,371 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed: new name and repository
+
+- **The project is now `equalify-iris-canvas`, "Equalify Iris for Canvas"**,
+  named like its siblings
+  [equalify-iris-wp](https://github.com/EqualifyEverything/equalify-iris-wp)
+  and [equalify-iris-drupal](https://github.com/oshrizak/equalify-iris-drupal),
+  in its own repository:
+  https://github.com/oshrizak/equalify-iris-canvas. The Python package is
+  still `connector`, and nothing changes in Canvas: the tool keeps its name,
+  URLs and keys.
+- **Moving a Docker deployment to a folder with the new name** starts it on
+  an empty Redis volume unless `COMPOSE_PROJECT_NAME` keeps the old project
+  name. [`docs/MIGRATING_FROM_REFLOW.md`](docs/MIGRATING_FROM_REFLOW.md),
+  step 2, has the commands.
+
+### Changed — Equalify Iris replaces Reflow Core (breaking)
+
+- **Documents are now converted by [Equalify Iris](https://github.com/EqualifyEverything/equalify-iris)**
+  (`/v1/sessions`) instead of Equalify Reflow Core (`/api/v1/documents`).
+  New settings `IRIS_API_BASE_URL` and `IRIS_API_TOKEN`; `REFLOW_API_*` and
+  `S3_*` are legacy, used only while migrating. Upgrade path, including a
+  side-by-side period and copying Reflow-era documents out of Reflow Core:
+  [`docs/MIGRATING_FROM_REFLOW.md`](docs/MIGRATING_FROM_REFLOW.md). API
+  contract: [`docs/IRIS_API.md`](docs/IRIS_API.md).
+- **The connector stores each converted document** (Iris's stitched,
+  sanitized HTML) in Redis and every surface reads it from there
+  (`connector/canvas/content.py`): Canvas Page, alt formats, WCAG score,
+  editor, review. Reflow was called on every alt-format view; Iris is never
+  called to show a document.
+- **Faculty disclaimer, version 2.0.** Iris runs no PII scan, so the text no
+  longer says documents are screened and redacted; it says they are not, and
+  faculty acknowledge it again at their next launch. Background conversion in
+  a course waits until its owner (whose Canvas token the watcher uses) has
+  accepted version 2.0, and resumes on its own after.
+- **No privacy pause.** Iris documents never enter `awaiting_approval`; the
+  PII decision endpoints answer 409 for them. Reflow-era documents keep the
+  old flow while Reflow Core is configured.
+- **Figures come from the source PDF.** Iris returns descriptions and
+  page-numbered placeholders, never image files. The bridge matches them to
+  each page's embedded rasters in reading order (down the left column first
+  on two-column pages; skipping scanned-page backgrounds and running-head
+  logos; declining ambiguous pages) and shows an unmatched picture as its
+  description, naming the original page.
+- **Job records are written as merges.** `put_job` writes back only the
+  fields its holder changed, onto the record as stored now, so the watcher,
+  the bridge, the sweeper and the API cannot undo each other's changes (for
+  Iris, a forgotten session id would mean paying for a part twice). Deleted
+  jobs are not recreated; the sweeper's write is conditional.
+- **Long documents are converted in parts** of up to Iris's page cap (25),
+  balanced (26 pages = 13 + 13), and stitched: ids that clash between parts
+  are renamed with the references to them, and links between parts (a
+  contents list, endnotes at the back) reach their targets. The review
+  screen names the seams.
+- **The spend cap reserves by page** (`IRIS_ESTIMATED_COST_PER_PAGE_CENTS`)
+  and trues up from Iris's token counts when `IRIS_PRICE_*_PER_MTOK_USD` are
+  set.
+- ePub metadata no longer names Reflow as the author; HTML and ePub carry the
+  document language Iris reports.
+
+### Added — for Iris
+
+- `connector/canvas/iris_client.py` (HTTP client: GET retries, typed errors
+  that say whether a failed upload may have reached Iris), `iris_documents.py` (Word/PowerPoint to PDF with
+  LibreOffice, page counts, cutting into parts), `iris_jobs.py` (create,
+  upload, poll, complete; upload lock and 429/outage pause shared by both
+  workers), `iris_output.py` (stitching, figure manifest, MathML and print
+  page handling for the text-only formats, Markdown export), `iris_notes.py`.
+- **"Check before approving" notes** on the review screen
+  (`GET /canvas/review/{job}/notes`) and in the overlay's score payload:
+  pages Iris could not convert, pages that failed its own fidelity check,
+  issues it left open, figures shown as text, seams between parts.
+- **Recovery.** Throttled uploads wait for Iris's `Retry-After`; an outage
+  (including a gateway 502) pauses uploads for as long as it lasts; uploads
+  whose outcome is unknown are retried at most three times per part, counted
+  even when a restart cuts one short; parts Iris lost (its own
+  `session_not_found`/`session_expired`, or `expired_at`) are sent again
+  while the document is wanted; every failed part is recorded at once; the stale-job
+  sweeper spares documents Iris is still working on or that are waiting out
+  a throttle, and a document it failed resumes on its own if Iris turns out
+  to be working on it. A file replaced mid-conversion starts over; a deleted
+  one is forgotten.
+- **"Try again"** on the Accessible Documents page for a document that did
+  not convert (instructors, CSRF-protected, current disclaimer required):
+  re-sends only the parts that failed, reserving their cost again. The
+  overlay's convert route and the new `connector.tools.retry_failed_jobs`
+  (operators, in bulk, after an Iris-side outage) use the same rule.
+- Re-uploading a file whose earlier conversion failed or was deleted now
+  converts it, instead of aliasing it to the dead record.
+- **MathML support** in the sanitizer (MathML Core) and the alt formats:
+  plain text, audio, translation, the tagged PDF and braille read MathML as
+  its LaTeX; braille paginates by Iris's print page markers.
+- `connector.tools.migrate_reflow_jobs` — copies finished Reflow-era
+  documents into Redis before Reflow Core is retired; hands unfinished ones
+  to Iris.
+- Iris checks in `scripts/preflight.py` and the startup audit: reachable,
+  gated (an open Iris is `CRITICAL`), and accepts our token.
+- LibreOffice in the Docker image (`--build-arg WITH_LIBREOFFICE=false` to
+  leave it out): Word and PowerPoint files the watcher picks up (`.docx`,
+  `.pptx`, `.doc`) are converted to PDF before they go to Iris.
+- `erase_user` lists the Iris session ids of the erased jobs, for removal on
+  the Iris host.
+- `IRIS_CLOSE_SESSIONS_ON_APPROVE` (off by default): close the Iris sessions
+  of documents approved without edits.
+
+### Removed
+
+- Reflow Core is no longer required, and S3 / presigned-URL settings are
+  unused for new documents.
+
+### Security
+
+- Iris has no user accounts: without `IRIS_API_TOKEN` anyone who can reach it
+  can list and read every converted document. The connector reports an open
+  Iris as `CRITICAL` at startup and as an error in preflight, and the deploy
+  and migration docs put Iris on a private network with a session retention.
+- Nothing is sent to Iris for someone who has not accepted the version 2.0
+  disclaimer (see above).
+- The public figure route only redirects to figures already in Canvas; it no
+  longer downloads and parses a source PDF on demand for unauthenticated
+  requests.
+- LibreOffice runs with a minimal environment, without the connector's
+  secrets, while it reads uploaded Office files.
+
+### Security — review screens
+
+Found while adding "Try again"; these predate the move to Iris.
+
+- **Approve and reject on the review screen** (`/canvas/review/{job}/approve`,
+  `/reject`) now require an instructor role and the session's CSRF token,
+  like the overlay's equivalents. Before, any session in the course
+  (a student's included) could publish or delete a document's page, and
+  another site could trigger it with a forged form.
+- **The automatic-conversion switch** (`POST /canvas/review/api/optin`) now
+  requires the CSRF token and only acts on the session's own course. Before,
+  an instructor in one course could switch on scanning of another by naming
+  it in `?course_id=`.
+- **Every review page and list is scoped to the course the session was
+  launched from**; naming another course in `?course_id=` returns 403 instead
+  of that course's documents.
+- **Template values are escaped** for where they land: a Canvas file name
+  could run script on the single-document review page, and `?course_id=` was
+  reflected into a script on the list and dashboard pages. The live Canvas
+  Page shown beside a draft is escaped (title) and sanitized (body) too.
+- **Unpublished documents need an instructor session.** `?preview=1` on
+  `/canvas/panorama/alt/{job}/{fmt}` opened any draft, rejected or failed
+  conversion with no session at all, and the public overlay list hands out
+  job ids. It is now only a hint: drafts (and their figures) open for an
+  instructor, TA, designer or admin with a live session in that course.
+- Known gap, documented in OPERATIONS.md: the overlay's listing endpoints
+  still name every converted file in a course to anyone who asks.
+
+### Verified — Iris
+
+- Against a live Iris 1.3.0 (gated, mock model provider): the client's whole
+  wire contract, a 30-page PDF in two sessions stitched with figures lifted
+  and rendered, a 26-page upload refused with Iris's 400, and the real
+  watcher and bridge loops taking a 40-page PDF to a written Canvas Page
+  (Canvas faked in memory).
+- The Docker image's LibreOffice layer on the `python:3.11-slim` base (Debian
+  13): Word and PowerPoint files convert to PDF headless, with the
+  connector's own command line, in about a second each.
+- An independent review of the Iris path (wire contract, job state machine,
+  stitching, sanitizing, secrets, figure route); its findings are fixed above
+  and covered by `tests/integration/test_iris_recovery.py`.
+- "Try again" driven end to end in Chromium against the real review screen.
+- **CI**: 283 tests passing. Ruff + mypy clean across 65 source files.
+
+### Added
+
+- **Whole-course review screen** (`GET /canvas/review/api/files`). The review
+  page previously read only the pending set, so a document that was
+  converting, published or broken was invisible — it could not answer "where
+  is everything?", which is the question it gets opened to settle. One row per
+  Canvas file, with the live job winning over stale failures.
+- **`docs/TROUBLESHOOTING.md`** — production failure modes and how to tell
+  them apart, including CDN/WAF 403s that masquerade as permission errors.
+- **Working `scripts/preflight.py`** — validates `.env` before boot and names
+  the common first-run mistakes (missing key pair, placeholder client id,
+  trailing slash on `LTI_PUBLIC_URL`). Previously a stub that exited 1.
+- **`CONSENT_EXTRA_FRAME_ANCESTORS`** setting. The consent page's CSP
+  hardcoded one university's domains, which silently broke the page for every
+  other institution.
+
+- **PDF figure extraction from the source PDF** (`connector/canvas/pdf_figures.py`,
+  `connector/tools/reprocess_figures.py`). Bypasses Reflow's vision-pipeline
+  S3 PNGs (which carry a tile/segmentation grid overlay) and pulls clean
+  embedded rasters directly via PyMuPDF. Matching uses Reflow's per-figure
+  page number + reading-order rank within the page. Vector figures fall back
+  to Reflow's S3 copy. CLI script backfills existing jobs.
+- **Same-origin figure proxy** at `/canvas/panorama/alt/{job}/figures/{ref}`
+  serves PDF-extracted bytes when the bridge hasn't uploaded to Canvas Files
+  yet, keeping rendered HTML self-contained even mid-rollout.
+- **Tagged PDF output** (PDF/UA-1) via WeasyPrint for born-digital inputs.
+  Real structure tree (`StructTreeRoot`, `MarkInfo /Marked true`,
+  `ViewerPreferences /DisplayDocTitle`), structure elements for H1/H2/P/L/LI/Table/TR/TD/Figure.
+  Auto-routes between WeasyPrint (text PDFs) and ocrmypdf (scans) based on
+  `pdf_has_text_layer`.
+- **Server-side LaTeX → inline SVG math rendering** (`connector/canvas/math_render.py`)
+  so the Tagged PDF carries rendered equations rather than literal `$E=mc^2$` text.
+  Uses matplotlib's mathtext (LaTeX subset, no system TeX install needed). LaTeX
+  source rides along as `<img alt>` so screen readers consuming the PDF speak
+  it correctly.
+- **mhchem chemistry preprocessing** — `\ce{H2O}` → `H_{2}O`, `\ce{... -> ...}` →
+  `\rightarrow`, then handed to mathtext. Handles the common subset; complex
+  reactions fall through as text.
+- **Math/chemistry auto-detection in HTML output.** `html_full_document` enables
+  MathJax (with the mhchem extension) when LaTeX delimiters or `\ce{}` are
+  present in the rendered body. Inline-`$...$` regex tightened to skip prose
+  with money values.
+- **PII review surfaced in the LTI tool's queue.** `awaiting_approval` jobs
+  now join the per-course pending set alongside `awaiting_review` jobs;
+  index.html renders distinct badges (PII review vs Accessibility review) and
+  routes PII rows to a dedicated `/canvas/review/{job}/pii` page. CSRF token
+  embedded server-side so the form actually submits.
+- **WCAG publication gate UI.** The approve handler returns structured 409s
+  (`error: wcag_gate_blocked` / `checklist_incomplete`) when `REQUIRE_WCAG_GATE=true`;
+  the panorama overlay catches them and swaps the action row for an inline
+  gate panel — 4-item checklist plus per-rule waiver checkboxes. Same POST
+  resubmits with `waivers` and `checklist` populated.
+- **Live PDF + Canvas Page proxies** on the per-document review screen
+  (`/canvas/review/{job}/pdf` and `/canvas/review/{job}/canvas-page`) so faculty
+  see the original PDF and the live published Canvas Page side-by-side without
+  the cross-origin iframe block.
+- **Pending-scan marker on Files page rows** for PDFs the watcher hasn't
+  picked up yet, with a tooltip explaining the ~60s window.
+- **Audio MP3 + Translate alt-formats** properly wired: Audio uses Amazon Polly
+  (`polly:SynthesizeSpeech`); Translate uses Anthropic Claude Sonnet 4.5 directly
+  (no pydantic-ai / model-tier indirection). Both surface clean 503s when
+  credentials are missing.
+- **OAuth tokens encrypted at rest** with AES-GCM. Key derivation: explicit
+  `TOKEN_ENCRYPTION_KEY` → `CSRF_SECRET_KEY` derivation → hardcoded constant.
+  The constant fallback now logs `CRITICAL` once per process with the keygen
+  command.
+- **Startup secrets audit** in `main.lifespan` logs `CRITICAL` per missing
+  production-required secret (encryption key, CSRF key, Reflow API key
+  placeholder). Doesn't block boot.
+- **`connector/tools/generate_keys`** mints fresh `TOKEN_ENCRYPTION_KEY` and
+  `CSRF_SECRET_KEY` (`secrets.token_urlsafe(32)` each).
+- **Rate limiting** (`connector/utils/rate_limit.py`) on every state-changing
+  POST/PUT, scoped per `(endpoint, user_id)`. 30/min for approve/reject/etc.,
+  60/min for editor saves, 10/min for PII decisions, 5/min for bulk approve.
+  Redis fixed-window counter with auto-expiry.
+- **Redis persistence** turned on in `docker-compose.yml` — AOF
+  (`appendfsync everysec`) + RDB snapshots, named `redis-data` volume,
+  `restart: unless-stopped`. Container lifecycle no longer wipes faculty
+  consent records, the audit log, or OAuth tokens.
+- **Off-host backup script** (`scripts/backup-redis.sh`) — `BGSAVE` → poll
+  `LASTSAVE` → `docker cp` → optional S3 upload via `aws` CLI →
+  retention-window prune. Cron-friendly.
+- **Integration test suite** (`tests/integration/`) using `fakeredis` + the
+  real FastAPI app + LTI session + CSRF + rate-limit plumbing. Covers the
+  PII decision wire contract, the approve flow's state persistence, and the
+  rate-limiter threshold.
+- **`OPERATIONS.md` runbook** — secrets checklist, Redis backup/restore,
+  rate-limit table, common breakage modes from the CSU East Bay pilot,
+  key rotation consequences.
+
+### Fixed
+
+- **Braille output is now a transcription, not a text dump.** BRF is built
+  from structural blocks — headings, paragraphs, lists, table rows, figure
+  descriptions, print page numbers — translated per run and typeset to BANA
+  page geometry (40x25, form feeds, braille page numbers, words never split
+  across a line or page). Two defects this corrects: the base table was
+  `en-us-g2.ctb` (pre-2016 EBAE) where the standard is UEB; and a document
+  containing *any* maths had **all** of its prose transcribed in Nemeth, a
+  mathematical notation — and since `nemeth.ctb` is absent from Debian's
+  liblouis packaging, those documents in fact failed to translate at all.
+  The maths table is now probed at runtime (Nemeth when available, otherwise
+  UEB Technical) rather than hardcoded.
+
+  Layout is done in `connector/canvas/braille_layout.py` rather than by
+  liblouisutdml (`file2brl`), which on this packaging fails to compile its
+  own semantic-action files and returns exit status 0 with zero bytes of
+  output in every input mode. See [`docs/BRAILLE.md`](docs/BRAILLE.md).
+- **`preprocess_chemistry` moved to `connector/canvas/chemistry.py`** so
+  the braille path no longer imports matplotlib to run a regex. Re-exported
+  from `math_render` for compatibility.
+- **Token scope erosion on refresh.** Canvas does not carry consented scopes
+  across a refresh when the developer key enforces scopes; it substitutes the
+  key's defaults. The refresh grant now sends the full scope list, and that
+  list is a single shared object so the authorize and refresh legs cannot
+  drift apart. Symptom was a tool that worked for exactly one hour after each
+  consent, then 401'd on every read.
+- **IPv4 literals in generated pages.** A bare dotted quad anywhere in a page
+  body matches SSRF signatures in managed WAF rule sets, so Canvas Cloud's CDN
+  rejected the write before Canvas saw it — with an HTML 403 indistinguishable
+  from a permissions failure. Dots are now entity-encoded at render time;
+  links resolve and text reads identically.
+- **Canvas error bodies are logged.** `CanvasApiError` carries the response
+  body and non-404 failures log it at `WARNING`. It was previously `DEBUG`,
+  which left production logs showing a status code and nothing else.
+- **Deleted documents are forgotten.** When Canvas returns 404 for a source
+  file, the bridge purges the job record, review-queue entry, processed marker
+  and page mapping. Records used to outlive their source and retry forever.
+
+- **PII decision endpoint URL.** The connector used to POST to
+  `/api/v1/documents/{job}/pii/approve`, which Reflow Core never had —
+  Core returned 405 Method Not Allowed, the connector wrapped that as 502,
+  and the panorama overlay's `fetch` came back as "Failed to fetch". Core's
+  actual PII gate uses an approval-token model:
+  `POST /api/v1/approval/{token}/decision`, where the token comes from the
+  job's status payload. The connector now does that. Closes the
+  "PII approve/deny pending upstream" follow-up.
+- **`get_page` slug normalization.** Was 404'ing because the connector
+  stored the full Canvas Page URL as `canvas_page_url` and `get_page`
+  interpolated it directly into the API path. Now uses `_page_ref` like
+  every sibling page method (publish_page, update_page, delete_page).
+- **Approve/reject/PII-gate routes used the bare `CanvasClient()` constructor,**
+  which fell back to env-token and 500'd on Canvas Cloud. All now use
+  `_canvas_client_for_job` (instructor OAuth token).
+- **WeasyPrint `pdf_variant` kwarg silently dropped** when passed inside
+  an `options=` dict (only logged a one-line warning). The Tagged PDF had
+  no `StructTreeRoot`. Pass as a direct kwarg — Acrobat's Accessibility
+  panel now reads the tree.
+- **Standalone images mapped to `Figure` inside `P`** in the tagged-PDF
+  structure tree because CommonMark wraps any `![alt](src)`-only line in a
+  paragraph. `markdown_to_html.render` promotes those to `<figure>` so
+  Figure becomes a sibling of P, per PDF/UA-1.
+- **`_pii_approval_page` form POSTed without the CSRF token** the decision
+  endpoint requires. Token is now embedded server-side.
+- **Score labelling.** Dial and modal report stopped framing the
+  PDF/UA score (veraPDF, original PDF) and the WCAG structural score
+  (generated HTML) as a before/after — they measure two different
+  documents with two different tools and aren't directly comparable.
+  Labels and tooltips updated; numbers themselves unchanged.
+
+### Verified
+
+- **2026-06-19** — end-to-end against CSU East Bay Canvas: LTI launch,
+  OAuth consent, PDF discovery, Reflow Core submission, Canvas Page write,
+  PII decision via the real approval-token endpoint, Tagged PDF with
+  veraPDF-confirmed structure tree, rate limiting fires at the configured
+  threshold under load, secrets audit fires CRITICAL when keys are missing.
+- **CI**: 69 tests passing (63 unit + 6 integration). Ruff + mypy clean
+  across 52 source files.
+
+
+### Changed
+- Removed internal working documents (`FIXES.md`, `PORTING_BRIEF.md`) and
+  one-off diagnostic spikes from `scripts/`. Institution-specific hostnames in
+  comments and examples replaced with neutral placeholders.
+- `scripts/` now ships in the Docker image — operator tooling was previously
+  unrunnable in the container where it is needed.
+
+
+## [0.1.0] — 2026-06-18
+
+### Added
+
+- Initial scaffold extracted from the `equalify-reflow` fork's working
+  Canvas LTI integration (validated end-to-end against a production
+  Canvas instance on 2026-06-17). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+  for the component map.
+
+### Verified
+
+- Local end-to-end smoke test against the source fork stack:
+  `docker compose up` boots cleanly, `/health`, `/lti/config.json`, and
+  `/lti/jwks.json` return well-formed responses, and the connector's
+  `ReflowClient.submit_document` + `get_status` successfully drive a PDF
+  submission.

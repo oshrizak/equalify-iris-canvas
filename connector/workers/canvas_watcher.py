@@ -1,0 +1,1017 @@
+"""Canvas file-discovery watcher.
+
+Scans every surface a faculty member or student could attach a file to
+inside a Canvas course, accumulates a deduplicated set of file ids, then
+submits each PDF Reflow hasn't seen before.
+
+Surfaces covered (all on a 60s default poll):
+  1. Files page  /courses/:id/files
+  2. All folders /courses/:id/folders + /folders/:id/files
+     (catches RCE-paperclip uploads that land in hidden internal folders)
+  3. Modules     /courses/:id/modules/:id/items where type == "File"
+  4. Pages       /courses/:id/pages -> body HTML scanned for file refs
+  5. Discussions /courses/:id/discussion_topics (incl. announcements) —
+     TOPIC level only. The topic message HTML and the instructor's own
+     topic attachments. Discussion *entries* are deliberately NOT
+     scanned: their attachments are student work, and converting those
+     without the student's knowledge is out of scope for proactive
+     remediation. Students needing an accessible copy go through DSS.
+  6. Assignments /courses/:id/assignments — description HTML
+  7. Quizzes     /courses/:id/quizzes — description HTML
+  8. Syllabus    /courses/:id?include[]=syllabus_body
+
+After id collection, each fresh file id is resolved via
+``GET /files/:id`` for metadata, filtered to convertible documents, and
+submitted to Equalify Iris (see :mod:`connector.canvas.iris_jobs`). The
+processed set in Redis guards against double-submission.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import re
+import time
+from dataclasses import asdict
+from typing import Any
+
+from redis.asyncio import Redis
+
+from ..canvas.client import CanvasClient
+from ..canvas.consent_gate import course_owner_consents
+from ..canvas.errors import CanvasApiError
+from ..canvas.iris_client import IrisClient
+from ..canvas.iris_documents import DocumentPrepError, is_office_document, soffice_binary
+from ..canvas.iris_jobs import (
+    RETRY_HINT,
+    acquire_upload_lock,
+    estimate_cost_cents,
+    failed_job,
+    max_pages_per_session,
+    new_job,
+    pending_parts,
+    prepare_document,
+    release_upload_lock,
+    upload_backoff_active,
+    upload_pending_parts,
+    upload_throttled,
+)
+from ..canvas.spend_cap import reserve_submission
+from ..canvas.state import (
+    already_processed,
+    get_job,
+    get_job_for_hash,
+    has_recent_iris_activity,
+    is_course_enabled,
+    mark_processed,
+    put_file_alias,
+    put_job,
+    put_job_for_hash,
+)
+from ..canvas.tenant import tk
+from ..canvas.user_oauth import get_user_token
+from ..canvas.verapdf_audit import VeraPDFError
+from ..canvas.verapdf_audit import run_audit as _verapdf_run_audit
+from ..config import settings
+from ..lti.platform import PlatformInstall
+from ..lti.platform_store import (
+    get_course_owner,
+    get_courses_for_platform,
+    list_platforms,
+)
+
+# File extensions VeraPDF can audit. Everything else (.docx, .pptx, etc.)
+# the watcher converts to PDF for Iris but doesn't audit — the PDF
+# LibreOffice makes is not the faculty member's file. Lower-cased compare.
+_AUDITABLE_EXTS = (".pdf",)
+
+# Default scope set the watcher's CanvasClient asks for in multi-tenant
+# mode. Matches the readable-discovery subset declared in
+# /lti/config.json so a Developer Key approved for the full scope list
+# can satisfy these requests without surprise.
+_WATCHER_SCOPES = [
+    "url:GET|/api/v1/courses/:course_id/files",
+    "url:GET|/api/v1/courses/:course_id/folders",
+    "url:GET|/api/v1/courses/:course_id/modules",
+    "url:GET|/api/v1/courses/:course_id/modules/:module_id/items",
+    "url:GET|/api/v1/courses/:course_id/pages",
+    "url:GET|/api/v1/courses/:course_id/pages/:url_or_id",
+    "url:GET|/api/v1/courses/:course_id/discussion_topics",
+    "url:GET|/api/v1/courses/:course_id/discussion_topics/:topic_id/entries",
+    "url:GET|/api/v1/courses/:course_id/assignments",
+    "url:GET|/api/v1/courses/:course_id/quizzes",
+    "url:GET|/api/v1/files/:id",
+    "url:GET|/api/v1/folders/:id/files",
+]
+
+logger = logging.getLogger(__name__)
+
+# How long before we re-attempt creating a course's drop folder. Long
+# enough that a course whose token lacks manage_files isn't retried every
+# tick; short enough that a folder someone deleted comes back same-day.
+_DROP_FOLDER_RETRY_SECONDS = 6 * 60 * 60
+
+
+async def _run_verapdf_audit(
+    filename: str, content: bytes
+) -> dict[str, Any] | None:
+    """Run the VeraPDF PDF/UA audit and return a dict ready for CanvasJob.
+
+    Wraps ``connector.canvas.verapdf_audit.run_audit`` with the policy
+    the watcher needs:
+
+      * Skip non-PDF uploads (no source PDF to audit).
+      * Swallow ``VeraPDFError`` so a binary-missing / timeout / parse
+        failure doesn't kill the submission. The dial just falls back
+        to no audit data; faculty still get the converted output.
+
+    Returns ``None`` when no audit was produced.
+    """
+    if not filename.lower().endswith(_AUDITABLE_EXTS):
+        return None
+    try:
+        result = await _verapdf_run_audit(content)
+    except VeraPDFError as exc:
+        logger.warning(
+            "VeraPDF audit skipped for %s: %s",
+            filename, exc,
+        )
+        return None
+    except Exception:
+        logger.exception(
+            "Unexpected VeraPDF audit failure for %s — submission continues",
+            filename,
+        )
+        return None
+    return {
+        "score": result.score,
+        "is_compliant": result.is_compliant,
+        "violations": [asdict(v) for v in result.violations],
+        "audited_at": time.time(),
+    }
+
+
+# Regexes that extract Canvas file ids from arbitrary HTML content. Covers
+# all the URL shapes Canvas's RCE and APIs produce:
+#   - /courses/X/files/Y
+#   - /files/Y/preview
+#   - /files/Y/download
+#   - data-api-endpoint=".../files/Y"
+#   - <a class="instructure_file_link" href=".../files/Y/preview">
+_FILE_ID_PATTERNS = [
+    re.compile(r"/files/(\d+)(?:[/?#\"\\']|$)"),
+    re.compile(r"data-api-endpoint=\"[^\"]*/files/(\d+)\""),
+]
+
+
+def _extract_file_ids_from_html(html: str | None) -> set[str]:
+    if not html:
+        return set()
+    ids: set[str] = set()
+    for pattern in _FILE_ID_PATTERNS:
+        for match in pattern.finditer(html):
+            ids.add(match.group(1))
+    return ids
+
+
+# Document types the connector can convert. Iris reads PDFs; Word and
+# PowerPoint files are turned into PDFs with LibreOffice first (when it is
+# installed — see connector.canvas.iris_documents).
+_CONVERTIBLE_EXTS = (".pdf", ".docx", ".pptx")
+_CONVERTIBLE_MIMES = {
+    "pdf",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
+    "doc",
+    "application/msword",  # legacy .doc — LibreOffice turns it into a PDF like .docx
+}
+
+
+def _is_convertible(file_meta: dict[str, Any]) -> bool:
+    """True if the file is in a format the connector can convert to accessible HTML."""
+    mime = (file_meta.get("content-type") or file_meta.get("mime_class") or "").lower()
+    name = (file_meta.get("display_name") or file_meta.get("filename") or "").lower()
+    if mime in _CONVERTIBLE_MIMES:
+        return True
+    return any(name.endswith(ext) for ext in _CONVERTIBLE_EXTS)
+
+
+# Kept for backward compatibility; new code should call _is_convertible.
+def _is_pdf(file_meta: dict[str, Any]) -> bool:
+    return _is_convertible(file_meta)
+
+
+def _watched_courses() -> list[str]:
+    raw = getattr(settings, "canvas_watched_courses", "") or ""
+    return [c.strip() for c in str(raw).split(",") if c.strip()]
+
+
+def _multi_tenant_enabled() -> bool:
+    """Feature flag: when on, watcher iterates registered platforms."""
+    return bool(getattr(settings, "multi_tenant_watcher", False))
+
+
+async def _enumerate_scan_targets(
+    redis: Redis,
+) -> list[tuple[str, PlatformInstall | None]]:
+    """Decide what to scan this tick.
+
+    Returns a list of ``(course_id, platform_or_None)`` pairs. In legacy
+    single-tenant mode, ``platform`` is ``None`` and the existing
+    env-token CanvasClient handles auth. In multi-tenant mode the
+    platform record is supplied and the per-platform service-token
+    client is used.
+
+    Multi-tenant precedence is intentional: if a course is registered
+    under a platform AND named in canvas_watched_courses, the platform
+    path wins so the watcher doesn't double-scan with two different
+    auth modes.
+    """
+    if not _multi_tenant_enabled():
+        return [(cid, None) for cid in _watched_courses()]
+
+    targets: list[tuple[str, PlatformInstall | None]] = []
+    seen: set[tuple[str, str]] = set()
+    platforms = await list_platforms(redis)
+    for p in platforms:
+        if p.revoked_at:
+            logger.debug("skipping revoked platform %s", p.platform_id)
+            continue
+        course_ids = await get_courses_for_platform(redis, p.platform_id)
+        for course_id in course_ids:
+            key = (p.platform_id, course_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((course_id, p))
+
+    # Belt-and-suspenders: if any courses were listed in the legacy env
+    # var but have no platform association yet (e.g. operator added one
+    # for a not-yet-launched-via-LTI course), keep scanning them via the
+    # env token so they aren't silently dropped during the migration.
+    platform_courses = {cid for cid, _ in targets}
+    for cid in _watched_courses():
+        if cid not in platform_courses:
+            targets.append((cid, None))
+
+    return targets
+
+
+async def _make_canvas_client(
+    redis: Redis,
+    platform: PlatformInstall | None,
+    course_id: str | None = None,
+) -> CanvasClient:
+    """Construct the right CanvasClient for a (course, platform) pair.
+
+    Priority (best-auth-first):
+
+      1. **User-OAuth path** -- platform is known AND the course has a
+         stored owner AND that owner has a stored user_token. This is
+         the only path that actually works against the general Canvas
+         REST API in Canvas Cloud. The watcher reads on the faculty
+         owner's behalf, so discovered files and any pages the bridge
+         creates are attributed to that instructor.
+      2. **Service-token path** -- platform known but no owner/token.
+         Useful only for LTI Advantage services (NRPS, AGS); will 401
+         for general API calls. Logged as a warning.
+      3. **Env-token fallback** -- no platform at all (single-tenant
+         deployment). Requires CANVAS_API_TOKEN; raises otherwise.
+    """
+    if platform is None:
+        return CanvasClient()
+    if course_id:
+        owner_id = await get_course_owner(redis, course_id)
+        if owner_id:
+            try:
+                ut = await get_user_token(redis, platform.platform_id, owner_id)
+            except Exception:
+                ut = None
+            if ut is not None:
+                # Promoted to INFO: operators want a visible signal that
+                # the watcher is using the user-OAuth path (not the
+                # legacy env-token fallback). One line per course per
+                # scan tick is cheap and very valuable in incident review.
+                logger.info(
+                    "Watcher scan: course=%s using owner user_token (user_id=%s)",
+                    course_id, owner_id,
+                )
+                return CanvasClient.from_user_token(redis, platform, owner_id)
+    logger.warning(
+        "Watcher scan: course=%s has no stored owner/user_token; falling "
+        "back to LTI Advantage service token (general API calls will 401)",
+        course_id,
+    )
+    return CanvasClient.from_platform(redis, platform, _WATCHER_SCOPES)
+
+
+async def start_canvas_watcher(
+    redis: Redis,
+    *,
+    shutdown_event: asyncio.Event,
+    poll_interval_seconds: int | None = None,
+) -> None:
+    interval = poll_interval_seconds or int(getattr(settings, "canvas_poll_seconds", 60))
+    if _multi_tenant_enabled():
+        logger.info("Canvas watcher: multi-tenant mode enabled")
+    elif not _watched_courses():
+        logger.warning("Canvas watcher started with no watched courses; idling")
+
+    # One Iris client for every course: Iris has no per-tenant identity, so
+    # the connector is a single caller from Iris's point of view.
+    iris = IrisClient()
+
+    # Periodic maintenance runs every N watcher ticks so we don't pay the
+    # SCAN cost every iteration. Stale-job sweep is fast (a few minutes
+    # of staleness is acceptable); retention purge is slow and only needs
+    # to run every few hours.
+    stale_every = max(1, int(getattr(settings, "canvas_stale_sweep_every_ticks", 5)))
+    retention_every = max(1, int(getattr(settings, "canvas_retention_sweep_every_ticks", 240)))
+    tick = 0
+
+    while not shutdown_event.is_set():
+        try:
+            targets = await _enumerate_scan_targets(redis)
+        except Exception:
+            logger.exception("Failed to enumerate scan targets; skipping tick")
+            targets = []
+
+        for course_id, platform in targets:
+            try:
+                canvas = await _make_canvas_client(redis, platform, course_id)
+            except Exception:
+                logger.exception(
+                    "Cannot build Canvas client for course=%s platform=%s",
+                    course_id, getattr(platform, "platform_id", None),
+                )
+                continue
+            try:
+                await _scan_course(
+                    redis, canvas, iris, course_id,
+                    platform_id=getattr(platform, "platform_id", None),
+                )
+            except CanvasApiError as exc:
+                logger.warning("Canvas scan failed for %s: %s", course_id, exc)
+            except Exception:
+                logger.exception("Unexpected error scanning course %s", course_id)
+
+        tick += 1
+
+        if tick % stale_every == 0:
+            try:
+                swept = await sweep_stale_jobs(redis)
+                if swept:
+                    logger.info("Stale-job sweeper flipped %d job(s) to failed", swept)
+            except Exception:
+                logger.exception("Stale-job sweep failed")
+
+        if tick % retention_every == 0:
+            try:
+                summary = await _run_retention_sweep(redis)
+                if summary["jobs_removed"] or summary["audit_events_removed"]:
+                    logger.info(
+                        "Retention sweep removed %d job(s) and %d audit event(s)",
+                        summary["jobs_removed"], summary["audit_events_removed"],
+                    )
+            except Exception:
+                logger.exception("Retention sweep failed")
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+async def _run_retention_sweep(redis: Redis) -> dict[str, int]:
+    """Translate retention settings (in days) into a purge call.
+
+    Wrapped so the watcher loop stays readable and so tests can patch the
+    boundary without monkeypatching settings.
+    """
+    from ..canvas.state import purge_old_canvas_records
+
+    job_days = int(getattr(settings, "canvas_job_retention_days", 0))
+    audit_days = int(getattr(settings, "canvas_audit_retention_days", 0))
+    return await purge_old_canvas_records(
+        redis,
+        job_retention_seconds=job_days * 86400,
+        audit_retention_seconds=audit_days * 86400,
+    )
+
+
+async def sweep_stale_jobs(redis: Redis) -> int:
+    """Flip any ``processing`` job older than the configured age to ``failed``.
+
+    Why this exists: the bridge worker drives ``processing`` -> ``awaiting_review``
+    once the conversion completes, but if the conversion service goes away
+    or loses the job, the record sits in ``processing`` forever and the
+    faculty member sees a spinning dial with no resolution. Sweeping ages
+    the record out into ``failed`` after a cap (default 1 hour) so the modal
+    can show a real error message instead of pretending work is in flight.
+
+    An Iris job is only stale when Iris has shown no sign of working on it
+    for that long: a long PDF is several sessions that Iris runs a couple
+    at a time, so wall-clock age alone would fail documents that are simply
+    waiting their turn. The bridge marks activity whenever it sees a part
+    queued or running, and a job still waiting to upload is left alone
+    while Iris is throttling uploads.
+
+    Returns the number of jobs the sweep flipped, for logging by the caller.
+    """
+    import time
+
+    from ..canvas.state import get_job, put_job
+
+    max_age_seconds = int(getattr(settings, "canvas_stale_job_max_age_seconds", 3600))
+    cutoff = time.time() - max_age_seconds
+    # Waiting our turn because Iris throttled us is not "stuck"; waiting
+    # because Iris is unreachable is, after long enough.
+    throttled = await upload_throttled(redis)
+
+    flipped = 0
+    cursor = 0
+    while True:
+        cursor, keys = await redis.scan(
+            cursor=cursor, match=tk("canvas:job:*"), count=200
+        )
+        for raw_key in keys:
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            job_id = key.rsplit(":", 1)[-1]
+            job = await get_job(redis, job_id)
+            if job is None or job.status != "processing":
+                continue
+            if (job.created_at or 0) > cutoff:
+                continue
+            if job.is_iris:
+                if job.completed_at:
+                    continue  # converted; only the Canvas Page is outstanding
+                if await has_recent_iris_activity(redis, job_id):
+                    continue
+                if throttled and pending_parts(job):
+                    continue
+                job.status = "failed"
+                job.iris_stalled_at = time.time()
+                job.error = (
+                    f"Iris showed no progress on this document for more than "
+                    f"{max_age_seconds // 60} minutes (it may be down or unreachable). "
+                    f"{RETRY_HINT}"
+                )
+                # Only if nothing moved it on since it was read (the bridge
+                # may have completed it, or someone asked for it again).
+                if not await put_job(
+                    redis, job, only_if={"status": "processing", "completed_at": None},
+                ):
+                    continue
+                logger.warning(
+                    "Stale Iris job %s (file=%s course=%s) flipped to failed",
+                    job_id, job.canvas_file_name, job.canvas_course_id,
+                )
+                flipped += 1
+                continue
+            job.status = "failed"
+            job.error = (
+                f"Job stuck in 'processing' for more than {max_age_seconds}s; "
+                "the bridge worker never received a completion signal. "
+                "Re-upload the file to retry."
+            )
+            if not await put_job(redis, job, only_if={"status": "processing"}):
+                continue
+            logger.warning(
+                "Stale job %s (file=%s course=%s) flipped to failed",
+                job_id, job.canvas_file_name, job.canvas_course_id,
+            )
+            flipped += 1
+        if cursor == 0:
+            break
+    return flipped
+
+
+async def _discover_file_ids(canvas: CanvasClient, course_id: str) -> tuple[dict[str, dict], set[str]]:
+    """Discover every file id referenced in any course surface.
+
+    Returns (metadata_by_id, html_referenced_ids). The first contains
+    files we already have full metadata for (from listings); the second
+    is a set of ids found in HTML that we still need to resolve.
+    """
+
+    full: dict[str, dict[str, Any]] = {}
+    refs: set[str] = set()
+
+    # 1. Files page
+    try:
+        for f in await canvas.list_course_pdfs(course_id):
+            fid = str(f.get("id") or "")
+            if fid:
+                full[fid] = f
+    except CanvasApiError as exc:
+        logger.warning("files listing failed: %s", exc)
+
+    # 2. Folder walk (hidden folders, RCE paperclip uploads)
+    try:
+        for folder in await canvas.list_course_folders(course_id):
+            try:
+                for f in await canvas.list_folder_files(str(folder.get("id"))):
+                    fid = str(f.get("id") or "")
+                    if fid and fid not in full and _is_convertible(f):
+                        full[fid] = f
+            except CanvasApiError:
+                continue
+    except CanvasApiError as exc:
+        logger.warning("folder walk failed: %s", exc)
+
+    # 3. Modules
+    try:
+        for module in await canvas.list_modules(course_id):
+            try:
+                for item in await canvas.list_module_items(course_id, str(module.get("id"))):
+                    if (item.get("type") or "").lower() != "file":
+                        continue
+                    fid = str(item.get("content_id") or "")
+                    if fid and fid not in full:
+                        refs.add(fid)
+            except CanvasApiError:
+                continue
+    except CanvasApiError as exc:
+        logger.warning("module walk failed: %s", exc)
+
+    # 4. Pages — body HTML scanned for file refs
+    try:
+        pages = await canvas.list_pages(course_id)
+        for p in pages:
+            url = p.get("url")
+            if not url:
+                continue
+            try:
+                page = await canvas.get_page(course_id, url)
+            except CanvasApiError:
+                continue
+            refs |= _extract_file_ids_from_html(page.get("body"))
+    except CanvasApiError as exc:
+        logger.warning("pages scan failed: %s", exc)
+
+    # 5. Discussions + announcements — TOPIC level only.
+    #
+    # We deliberately do NOT descend into discussion *entries*. Entries are
+    # overwhelmingly student replies, and their attachments are student work.
+    # Sweeping those into an AI conversion pipeline is not proactive course
+    # remediation — it is processing student submissions without the student
+    # knowing, which:
+    #   * exceeds what the one-time faculty consent disclaimer covers (that
+    #     disclaimer is acknowledged by the instructor, not by students),
+    #   * cuts against the upstream rule "do not add features that process
+    #     student records or PII beyond the existing Presidio scan", and
+    #   * is the first thing an ISO or a union rep will ask about.
+    #
+    # A student who needs an accessible copy of their own or a peer's file
+    # goes through the accommodation route (DSS), which is a human decision
+    # with a documented basis — not a background job.
+    #
+    # Topic-level content is instructor-authored (the prompt and any files the
+    # instructor attached to it), so that stays in scope.
+    try:
+        topics = await canvas.list_discussion_topics(course_id, include_announcements=True)
+        for t in topics:
+            refs |= _extract_file_ids_from_html(t.get("message"))
+            # Attachments the instructor attached to the topic itself.
+            for att in t.get("attachments") or []:
+                aid = str(att.get("id") or "")
+                if aid:
+                    refs.add(aid)
+    except CanvasApiError as exc:
+        logger.warning("discussions scan failed: %s", exc)
+
+    # 6. Assignments
+    try:
+        for a in await canvas.list_assignments(course_id):
+            refs |= _extract_file_ids_from_html(a.get("description"))
+    except CanvasApiError as exc:
+        logger.warning("assignments scan failed: %s", exc)
+
+    # 7. Quizzes
+    try:
+        for q in await canvas.list_quizzes(course_id):
+            refs |= _extract_file_ids_from_html(q.get("description"))
+    except CanvasApiError as exc:
+        logger.warning("quizzes scan failed: %s", exc)
+
+    # 8. Syllabus body
+    try:
+        syl = await canvas.get_course_syllabus(course_id)
+        refs |= _extract_file_ids_from_html(syl.get("syllabus_body"))
+    except CanvasApiError as exc:
+        logger.warning("syllabus scan failed: %s", exc)
+
+    # Drop ids we already have full metadata for
+    refs -= set(full.keys())
+    return full, refs
+
+
+async def _discover_drop_folder_files(
+    canvas: CanvasClient,
+    course_id: str,
+    folder_name: str,
+    redis: Redis | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return convertible files sitting in the course's Reflow drop folder.
+
+    The drop folder is the explicit, per-document opt-in: a faculty member
+    copies a PDF into it to say "convert this one". It is scanned on every
+    tick regardless of whether full-course scanning is enabled, so someone
+    can try Reflow on a single file without authorising a sweep of
+    everything they have ever uploaded.
+
+    Matching is case-insensitive on the folder's leaf name so that
+    "Reflow - Convert to Accessible" and "reflow - convert to accessible"
+    both work — faculty retype these.
+
+    Returns an empty dict when the folder doesn't exist. We do not create it
+    here; the watcher should not be mutating course structure on a poll.
+    """
+    wanted = folder_name.strip().lower()
+    if not wanted:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        folders = await canvas.list_course_folders(course_id)
+    except CanvasApiError as exc:
+        logger.warning("drop-folder lookup failed for course %s: %s", course_id, exc)
+        return {}
+
+    found = False
+    for folder in folders:
+        leaf = str(folder.get("name") or "").strip().lower()
+        if leaf != wanted:
+            continue
+        found = True
+        try:
+            for f in await canvas.list_folder_files(str(folder.get("id"))):
+                fid = str(f.get("id") or "")
+                if fid and _is_convertible(f):
+                    out[fid] = f
+        except CanvasApiError as exc:
+            logger.warning(
+                "drop-folder listing failed for course %s folder %s: %s",
+                course_id, folder.get("id"), exc,
+            )
+
+    if not found and redis is not None:
+        # Materialise it once. A drop folder nobody knows to create is a
+        # feature nobody uses, and faculty shouldn't have to be told the
+        # exact folder name. Guarded by a TTL key so a course whose token
+        # lacks manage_files doesn't get a create attempt every tick; if
+        # someone deletes the folder it reappears after the TTL lapses.
+        guard = tk("canvas:course:{course_id}:dropfolder-init").format(
+            course_id=course_id
+        )
+        if await redis.set(guard, "1", ex=_DROP_FOLDER_RETRY_SECONDS, nx=True):
+            created = await canvas.create_course_folder(course_id, folder_name)
+            if created:
+                logger.info(
+                    "created Reflow drop folder %r in course %s",
+                    folder_name, course_id,
+                )
+    return out
+
+
+async def _find_sibling_file_ids(
+    canvas: CanvasClient,
+    course_id: str,
+    content: bytes,
+    *,
+    exclude_file_id: str,
+) -> list[str]:
+    """Find other Canvas files in this course with byte-identical content.
+
+    Faculty copy a PDF into the drop folder rather than moving it, so the
+    converted file has a fresh Canvas id while the copy students actually
+    click — the one linked from a Module or Page — keeps its old id. Without
+    this, the accessible page attaches to the folder copy and nobody ever
+    reaches it.
+
+    Cost control: Canvas returns ``size`` in file listings, so we only
+    download and hash files whose size matches exactly. Byte-identical PDFs
+    always have identical sizes, so this is a lossless filter and in practice
+    leaves one or two candidates.
+    """
+    target = hashlib.sha256(content).hexdigest()
+    size = len(content)
+    siblings: list[str] = []
+    try:
+        candidates = await canvas.list_course_pdfs(course_id)
+    except CanvasApiError as exc:
+        logger.warning("sibling lookup failed for course %s: %s", course_id, exc)
+        return []
+
+    for f in candidates:
+        fid = str(f.get("id") or "")
+        if not fid or fid == exclude_file_id:
+            continue
+        if int(f.get("size") or -1) != size:
+            continue
+        try:
+            other = await canvas.download_file(fid)
+        except Exception:  # noqa: BLE001 — a single unreadable file shouldn't stop the rest
+            logger.debug("sibling hash: could not read file %s", fid)
+            continue
+        if hashlib.sha256(other).hexdigest() == target:
+            siblings.append(fid)
+    return siblings
+
+
+async def _resolve_refs(canvas: CanvasClient, refs: set[str]) -> dict[str, dict[str, Any]]:
+    """Resolve a set of file ids to PDF metadata. Non-PDFs are dropped."""
+    out: dict[str, dict[str, Any]] = {}
+    for fid in refs:
+        try:
+            meta = await canvas.get_file_metadata(fid)
+        except CanvasApiError:
+            continue
+        if _is_pdf(meta):
+            out[fid] = meta
+    return out
+
+
+async def _scan_course(
+    redis: Redis,
+    canvas: CanvasClient,
+    iris: IrisClient,
+    course_id: str,
+    *,
+    platform_id: str | None = None,
+) -> None:
+    # Background conversions act for the course owner (whose Canvas token
+    # the watcher reads with), so they wait until the owner has accepted
+    # the current disclaimer. Courses enabled under an earlier version
+    # (which promised PII redaction Iris does not do) stay paused until
+    # then; nothing is marked processed, so they resume on their own.
+    if not await _owner_consent_current(redis, course_id):
+        return
+
+    # The drop folder is always live — that's the per-document opt-in, and
+    # it's how someone tries Reflow on one file before committing a course.
+    drop_folder = str(getattr(settings, "canvas_drop_folder_name", "") or "")
+    dropped = await _discover_drop_folder_files(
+        canvas, course_id, drop_folder, redis,
+    )
+
+    # Full-course scanning is gated. Until a human enables the course, we do
+    # NOT sweep Files/Modules/Pages/Assignments/etc. See config
+    # canvas_require_course_optin for the rationale.
+    require_optin = bool(getattr(settings, "canvas_require_course_optin", True))
+    course_enabled = (not require_optin) or await is_course_enabled(redis, course_id)
+
+    if course_enabled:
+        full, refs = await _discover_file_ids(canvas, course_id)
+        resolved = await _resolve_refs(canvas, refs)
+        all_pdfs = {**full, **resolved, **dropped}
+    else:
+        all_pdfs = dict(dropped)
+        if dropped:
+            logger.info(
+                "course %s is not opted in; converting %d drop-folder file(s) only",
+                course_id, len(dropped),
+            )
+
+    if not all_pdfs:
+        logger.debug(
+            "nothing to convert in course %s (opted_in=%s, drop_folder=%r)",
+            course_id, course_enabled, drop_folder,
+        )
+        return
+
+    new_count = 0
+    for file_id, f in all_pdfs.items():
+        if await already_processed(redis, course_id, file_id):
+            continue
+        # Iris asked us to slow down (or is unreachable). Leave the rest of
+        # this course's files unprocessed so the next tick picks them up;
+        # creating jobs Iris will not accept yet only makes them look stuck.
+        if await upload_backoff_active(redis):
+            logger.info(
+                "Iris uploads are paused; leaving remaining files in course %s for a later tick",
+                course_id,
+            )
+            break
+
+        filename = f.get("display_name") or f.get("filename") or f"file-{file_id}.pdf"
+        if is_office_document(filename, f.get("content-type")) and soffice_binary() is None:
+            _note_office_skipped(filename)
+            continue
+        # Canvas's Files API only exposes ``user_id`` when the calling
+        # token has admin scope; for the user-OAuth path it's typically
+        # empty. Falling back to the course owner (the instructor whose
+        # OAuth token is authorizing the scan) gives the bridge a real
+        # ``canvas_user_id`` to look up the per-user token with, which
+        # is the only auth that works against Canvas Cloud /api/v1.
+        uploader = str(f.get("user_id") or f.get("uploaded_by") or "")
+        if not uploader:
+            try:
+                owner = await get_course_owner(redis, course_id)
+                if owner:
+                    uploader = str(owner)
+                    logger.debug(
+                        "Watcher: file %s/%s has no uploader id; using "
+                        "course owner %s as canvas_user_id for routing",
+                        course_id, file_id, uploader,
+                    )
+            except Exception:  # noqa: BLE001 -- defensive
+                logger.exception(
+                    "Watcher: get_course_owner failed for %s; submitting "
+                    "job with empty canvas_user_id (bridge will fall back "
+                    "to LTI Advantage service token)",
+                    course_id,
+                )
+
+        try:
+            content = await canvas.download_file(file_id)
+        except Exception:
+            logger.exception("Failed to download file %s/%s", course_id, file_id)
+            continue
+
+        # Content-hash gate. Faculty copy a PDF into the drop folder, so the
+        # same document routinely appears under several Canvas file ids. If we
+        # already converted these exact bytes in this course, alias this file
+        # onto the existing job instead of paying to convert it again.
+        content_sha = hashlib.sha256(content).hexdigest()
+        prior_job = await get_job_for_hash(redis, course_id, content_sha)
+        prior = await get_job(redis, prior_job) if prior_job else None
+        # Only a live conversion is worth aliasing to. A pointer to a job
+        # that was deleted, or that failed without producing anything, would
+        # leave this copy unconverted for good; convert it instead (which is
+        # also how re-uploading a file retries it). A job the sweeper marked
+        # stalled is still live: it resumes on its own when Iris answers.
+        dead = (
+            prior is not None
+            and prior.status == "failed"
+            and not prior.completed_at
+            and not prior.iris_stalled_at
+        )
+        if prior is not None and not dead:
+            logger.info(
+                "Watcher: file %s/%s is byte-identical to an already-converted "
+                "document; aliasing to job %s instead of reconverting",
+                course_id, file_id, prior_job,
+            )
+            await put_file_alias(redis, course_id, file_id, prior.reflow_job_id)
+            await mark_processed(redis, course_id, file_id)
+            continue
+
+        # Turn the file into the PDF Iris reads. A file that cannot be
+        # converted at all (password-protected, not really a PDF, longer than
+        # IRIS_MAX_DOCUMENT_PAGES) gets a failed record that says why, so the
+        # faculty member sees the reason on the file instead of nothing.
+        try:
+            prepared = await asyncio.to_thread(prepare_document, filename, content)
+        except DocumentPrepError as exc:
+            logger.info("Not converting %s/%s (%s): %s", course_id, file_id, filename, exc)
+            await put_job(redis, failed_job(
+                course_id=course_id, file_id=file_id, filename=filename,
+                uploader=uploader, platform_id=platform_id, error=str(exc),
+                sha256=content_sha,
+            ))
+            await mark_processed(redis, course_id, file_id)
+            continue
+
+        # Check the per-course monthly AI-API spend cap. Iris is priced by
+        # the page, so the reservation is pages x the per-page estimate.
+        # ``reserve_submission`` atomically charges it and refunds it if we
+        # would blow the cap. When the cap is unlimited (default 0), this
+        # still records the spend - useful for cost reporting later.
+        estimate = estimate_cost_cents(prepared.page_count)
+        allowed, spend_info = await reserve_submission(
+            redis, course_id, estimate_cents=estimate,
+        )
+        if not allowed:
+            logger.warning(
+                "Skipping submission: course %s would exceed monthly spend cap "
+                "(spend=%d cents, cap=%d cents, this document ~%d cents)",
+                course_id, spend_info["spend_after_cents"], spend_info["cap_cents"], estimate,
+            )
+            # Mark processed so we don't keep retrying every tick. Operator
+            # raising the cap can clear the processed set for that course.
+            await mark_processed(redis, course_id, file_id)
+            continue
+
+        max_pages = await max_pages_per_session(iris)
+        job = new_job(
+            course_id=course_id, file_id=file_id, filename=filename,
+            uploader=uploader,
+            # Stamp the platform on every job created in multi-tenant mode
+            # so the bridge worker can route the result back to the right
+            # Canvas with the right credentials. Legacy single-tenant scans
+            # pass None, which the bridge reads as "use the env-token client".
+            platform_id=platform_id,
+            prepared=prepared, max_pages=max_pages, reserved_cents=estimate,
+        )
+        logger.info(
+            "Submitting new document to Iris: course=%s file=%s name=%s pages=%d parts=%d",
+            course_id, file_id, filename, prepared.page_count, len(job.iris_parts or []),
+        )
+        # The record exists before any upload, and the file is marked
+        # processed with it: whatever happens next, the bridge owns this
+        # document now and will finish (or retry) the uploads.
+        await put_job(redis, job)
+        await mark_processed(redis, course_id, file_id)
+        # Remember the content hash so a re-drop of the same bytes is
+        # recognised instead of reconverted.
+        await put_job_for_hash(redis, course_id, content_sha, job.reflow_job_id)
+
+        # Upload the parts and run the VeraPDF accessibility audit of the
+        # original concurrently. The audit doesn't gate submission — if
+        # verapdf isn't installed or times out the conversion still runs.
+        audit_task = asyncio.create_task(
+            _run_verapdf_audit(filename, content), name=f"verapdf_audit:{file_id}",
+        )
+        if await acquire_upload_lock(redis, job.reflow_job_id):
+            try:
+                await upload_pending_parts(redis, iris, job, prepared.pdf_bytes)
+            except Exception:  # noqa: BLE001 - the bridge retries pending parts
+                logger.exception("Iris upload failed for %s/%s", course_id, file_id)
+            finally:
+                await release_upload_lock(redis, job.reflow_job_id)
+        audit_result = await audit_task  # safe: errors swallowed in _run_verapdf_audit
+        if audit_result:
+            # Real PDF/UA audit of the source (replaces the canvas.signals
+            # heuristic for the dial's "before" number).
+            job.verapdf_score = audit_result["score"]
+            job.verapdf_is_compliant = audit_result["is_compliant"]
+            job.verapdf_violations = audit_result["violations"]
+            job.verapdf_audited_at = audit_result["audited_at"]
+            await put_job(redis, job)
+
+        # Point every byte-identical copy in this course at this job, so the
+        # accessible version surfaces on the file students actually open
+        # rather than only on the drop-folder copy. Best-effort: a failure
+        # here costs discoverability, not correctness, so it must not sink
+        # the conversion we just paid for.
+        try:
+            siblings = await _find_sibling_file_ids(
+                canvas, course_id, content, exclude_file_id=file_id,
+            )
+            for sib in siblings:
+                await put_file_alias(redis, course_id, sib, job.reflow_job_id)
+                await mark_processed(redis, course_id, sib)
+            if siblings:
+                logger.info(
+                    "Watcher: aliased %d identical cop%s of %s to job %s "
+                    "(course %s)",
+                    len(siblings), "y" if len(siblings) == 1 else "ies",
+                    filename, job.reflow_job_id, course_id,
+                )
+        except Exception:  # noqa: BLE001 — discoverability only
+            logger.exception(
+                "Watcher: sibling aliasing failed for %s/%s", course_id, file_id,
+            )
+
+        new_count += 1
+
+    if new_count:
+        logger.info("Course %s scan: %d new document(s) submitted (%d total discovered)",
+                    course_id, new_count, len(all_pdfs))
+    else:
+        logger.debug("Course %s scan: 0 new (%d already known)", course_id, len(all_pdfs))
+
+
+_consent_wait_noted: set[str] = set()
+
+
+async def _owner_consent_current(redis: Redis, course_id: str) -> bool:
+    """True when background conversion may run for this course (see
+    :mod:`connector.canvas.consent_gate`). Logs once per course while it
+    waits."""
+    try:
+        allowed, owner = await course_owner_consents(redis, course_id)
+    except Exception:  # noqa: BLE001 - fail closed: no evidence of agreement
+        logger.exception("Watcher: could not check consent for course %s", course_id)
+        return False
+    if allowed:
+        _consent_wait_noted.discard(course_id)
+        return True
+    if course_id not in _consent_wait_noted:
+        _consent_wait_noted.add(course_id)
+        logger.info(
+            "Watcher: not converting course %s until its owner (%s) accepts the "
+            "current disclaimer at their next launch",
+            course_id, owner,
+        )
+    return False
+
+
+_office_skip_noted: set[str] = set()
+
+
+def _note_office_skipped(filename: str) -> None:
+    """Say once per process that Office files are being skipped, and why.
+
+    Not marked processed: installing LibreOffice (or rebuilding the image
+    with it) should pick these files up without anyone clearing state.
+    """
+    if not _office_skip_noted:
+        logger.warning(
+            "Skipping Word/PowerPoint files: Iris reads PDFs, and LibreOffice "
+            "(soffice) is not installed to convert them (or "
+            "IRIS_CONVERT_OFFICE_DOCUMENTS=false). First skipped: %s", filename,
+        )
+    _office_skip_noted.add(filename)

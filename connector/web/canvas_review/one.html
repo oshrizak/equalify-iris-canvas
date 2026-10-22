@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{ csrf_token }}">
+<title>Review — {{ filename }}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 0; }
+  header { padding: 1rem 1.5rem; border-bottom: 1px solid #ddd; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 1.1rem; margin: 0; flex: 1 1 auto; }
+  button { padding: 0.5rem 1rem; border-radius: 4px; border: 1px solid #888; cursor: pointer; }
+  button.primary { background: #006633; color: white; border-color: #006633; }
+  button.danger { background: white; color: #a00; border-color: #a00; }
+  main { display: grid; grid-template-columns: 1fr 1fr; min-height: calc(100vh - 4rem); }
+  iframe { width: 100%; height: 100%; border: 0; }
+  .pane { border-right: 1px solid #ddd; padding: 1rem 1.5rem 0; display: flex; flex-direction: column; min-height: 0; }
+  .pane:last-child { border-right: 0; }
+  .pane iframe { flex: 1 1 auto; min-height: 0; background: #fff; }
+  h2 { font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.04em; color: #555; margin-top: 0; flex: 0 0 auto; }
+  #status { padding: 0.5rem 1.5rem; color: #444; min-height: 1.5rem; }
+  #notes { margin: 0 1.5rem 1rem; padding: 0.75rem 1rem; border: 1px solid #c9a400; border-left-width: 6px; border-radius: 4px; background: #fffbea; color: #222; }
+  #notes h2 { color: #222; margin-bottom: 0.5rem; }
+  #notes ul { margin: 0; padding-left: 1.25rem; }
+  #notes li { margin: 0.35rem 0; line-height: 1.4; }
+  #notes li ul { margin-top: 0.25rem; }
+  #notes .kind { font-weight: 600; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>{{ filename }}</h1>
+    <a id="open-in-canvas" hidden href="#" target="_blank" rel="noopener"
+       style="padding:0.5rem 1rem;border:1px solid #006633;color:#006633;text-decoration:none;border-radius:4px;">
+       Open in Canvas &#8599;
+    </a>
+    <button class="primary" id="approve">Approve &amp; publish</button>
+    <button class="danger" id="reject">Reject</button>
+  </header>
+  <div id="status" aria-live="polite"></div>
+  <section id="notes" hidden aria-labelledby="notes-heading">
+    <h2 id="notes-heading">Check before approving</h2>
+    <ul id="notes-list"></ul>
+  </section>
+  <main>
+    <section class="pane">
+      <h2>Original PDF</h2>
+      <iframe id="pdf-preview" title="Original PDF preview"></iframe>
+    </section>
+    <section class="pane">
+      <h2 id="preview-heading">Proposed accessible page</h2>
+      <iframe id="preview" title="Proposed accessible page preview"></iframe>
+    </section>
+  </main>
+
+<script>
+  const jobId = "{{ job_id }}";
+  const courseId = "{{ canvas_course_id }}";
+  const pageUrl = "{{ canvas_page_url }}";
+  const statusEl = document.getElementById("status");
+
+  // Canvas refuses to be iframed by external origins — its CSP
+  // ``frame-ancestors`` only allows its own institutional hosts. So
+  // both panes go through same-origin proxies on the connector:
+  //   * Left: ``/canvas/review/{job}/pdf`` streams the PDF bytes
+  //     (fetched server-side with the instructor's OAuth token) so the
+  //     browser's built-in PDF viewer renders inline.
+  //   * Right: ``/canvas/review/{job}/canvas-page`` fetches the live
+  //     Canvas Page body via API and wraps it in a minimal shell. If
+  //     the bridge hasn't published yet we fall back to the connector's
+  //     accessible HTML preview (the source the bridge will write).
+  // "Open in Canvas" stays in the header for when faculty want the
+  // full Canvas chrome.
+  const pdfFrame = document.getElementById("pdf-preview");
+  if (jobId) {
+    pdfFrame.src = `/canvas/review/${encodeURIComponent(jobId)}/pdf`;
+  }
+
+  const preview = document.getElementById("preview");
+  const previewHeading = document.getElementById("preview-heading");
+  if (pageUrl && jobId) {
+    preview.src = `/canvas/review/${encodeURIComponent(jobId)}/canvas-page`;
+    previewHeading.textContent = "Published Canvas page";
+  } else if (jobId) {
+    // ``?preview=1`` bypasses the faculty-approval gate on the alt
+    // route — necessary here because the whole point of the review
+    // screen is to look at the artifact BEFORE approving it. The route
+    // already supports this query for the Alt Formats modal.
+    preview.src = `/canvas/panorama/alt/${encodeURIComponent(jobId)}/html?preview=1`;
+  } else {
+    statusEl.textContent = "No previewable content for this job yet.";
+  }
+  if (pageUrl) {
+    const openLink = document.getElementById("open-in-canvas");
+    openLink.href = pageUrl;
+    openLink.hidden = false;
+  }
+
+  // What the converter said about its own output (pages it could not
+  // convert, pages that failed its accuracy check, issues left open).
+  // Built with textContent only: the items quote document text.
+  const KIND = { error: "Missing content:", warning: "Check:", info: "Note:" };
+  async function loadNotes() {
+    if (!jobId) return;
+    try {
+      const resp = await fetch(`/canvas/review/${encodeURIComponent(jobId)}/notes`);
+      if (!resp.ok) return;
+      const body = await resp.json();
+      const notes = Array.isArray(body.notes) ? body.notes : [];
+      if (!notes.length) return;
+      const list = document.getElementById("notes-list");
+      for (const note of notes) {
+        const li = document.createElement("li");
+        const kind = document.createElement("span");
+        kind.className = "kind";
+        kind.textContent = (KIND[note.severity] || "Note:") + " ";
+        li.appendChild(kind);
+        li.appendChild(document.createTextNode(note.message || ""));
+        if (Array.isArray(note.items) && note.items.length) {
+          const sub = document.createElement("ul");
+          for (const item of note.items) {
+            const subLi = document.createElement("li");
+            subLi.textContent = item;
+            sub.appendChild(subLi);
+          }
+          li.appendChild(sub);
+        }
+        list.appendChild(li);
+      }
+      document.getElementById("notes").hidden = false;
+    } catch (_err) {
+      // Notes are advisory; the review still works without them.
+    }
+  }
+  loadNotes();
+
+  async function act(action) {
+    statusEl.textContent = action === "approve" ? "Publishing…" : "Rejecting…";
+    try {
+      const csrf = document.querySelector('meta[name="csrf-token"]');
+      const resp = await fetch(`/canvas/review/${encodeURIComponent(jobId)}/${action}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf ? csrf.getAttribute("content") : "" },
+        body: "{}",
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(body.detail || `HTTP ${resp.status}`);
+      }
+      if (action === "approve") {
+        statusEl.textContent = body.warning
+          ? `Approved. ${body.warning}`
+          : "Published. Students can now see this page.";
+      } else {
+        statusEl.textContent = "Rejected. The draft has been deleted.";
+      }
+      // Hold the warning on screen a beat longer so faculty actually
+      // reads it before we navigate away.
+      const dwell = body.warning ? 6000 : 1500;
+      setTimeout(() => {
+        window.location.href = `/canvas/review?course_id=${encodeURIComponent(courseId)}`;
+      }, dwell);
+    } catch (err) {
+      statusEl.textContent = `Failed: ${err.message}`;
+    }
+  }
+
+  document.getElementById("approve").addEventListener("click", () => act("approve"));
+  document.getElementById("reject").addEventListener("click", () => act("reject"));
+</script>
+</body>
+</html>

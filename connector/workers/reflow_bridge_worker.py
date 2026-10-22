@@ -1,0 +1,1116 @@
+"""Bridge worker — turns finished conversions into draft Canvas Pages.
+
+For every conversion job that is not yet settled it:
+
+* **Iris jobs** — uploads any part Iris could not take yet, polls each
+  part's session, and when all are ready stitches their HTML into one
+  stored document (:mod:`connector.canvas.iris_jobs`); then lifts the
+  figures out of the source PDF into a course folder and creates or updates
+  an unpublished Canvas Page.
+* **Reflow jobs** (converted before the switch to Iris) — rebuilds a page
+  from the migrated snapshot when asked to, and, only while a legacy Reflow
+  Core is still configured, keeps driving in-flight Reflow jobs the way it
+  always did.
+
+Why a separate worker from the watcher: separation of concerns and
+independent retry/backoff. The watcher's job is to start work; this
+worker's job is to finish it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+
+import httpx
+from redis.asyncio import Redis
+
+from ..canvas.client import CanvasClient
+from ..canvas.content import ContentUnavailableError, legacy_reflow_configured, load_rendered
+from ..canvas.errors import CanvasApiError
+from ..canvas.iris_client import IrisApiError, IrisClient
+from ..canvas.iris_documents import DocumentPrepError, is_office_document
+from ..canvas.iris_jobs import (
+    acquire_upload_lock,
+    complete_job,
+    pending_parts,
+    poll_parts,
+    prepare_document,
+    release_upload_lock,
+    upload_backoff_active,
+    upload_locked,
+    upload_pending_parts,
+)
+from ..canvas.iris_output import figures_from_manifest
+from ..canvas.markdown_to_html import (
+    IRIS_GENERATOR,
+    REFLOW_GENERATOR,
+    RenderedPage,
+    render,
+    render_link_stub,
+)
+from ..canvas.reflow_client import ReflowClient, rewrite_presigned_url
+from ..canvas.state import (
+    IRIS_FIGURES_ATTEMPTS_KEY,
+    IRIS_FIGURES_RETRY_KEY,
+    CanvasJob,
+    clear_processed,
+    get_file_page,
+    get_job,
+    get_legacy_markdown,
+    purge_job,
+    put_file_page,
+    put_job,
+)
+from ..canvas.tenant import tk
+from ..config import settings
+from ..lti.platform_store import (
+    get_course_owner,
+    get_platform,
+    get_platform_for_course,
+)
+
+# Scopes the bridge needs to create + publish a Canvas Page and notify
+# the uploader. Strict subset of /lti/config.json so an admin who
+# approved the full set already covers this.
+# Course folder where converted-document figures are uploaded. Appears in
+# the course Files list; faculty can lock/hide it if they prefer. Keeping a
+# single named folder keeps the generated images tidy and easy to find.
+_FIGURE_FOLDER = "Reflow Generated Images"
+# Iris figures: wait this long after an attempt that left figures behind,
+# and stop after this many attempts (see _resolve_iris_figures).
+_FIGURE_RETRY_SECONDS = 15 * 60
+_FIGURE_MAX_ATTEMPTS = 4
+
+
+def _slugify(title: str) -> str:
+    """Approximate Canvas's wiki-page slug derivation from a title.
+
+    Lowercase, runs of non-alphanumerics -> single hyphen, trim hyphens.
+    Used as a fallback page reference so the first update-in-place run
+    reuses the existing page instead of creating yet another duplicate.
+    """
+    s = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return s or "page"
+
+_BRIDGE_SCOPES = [
+    "url:POST|/api/v1/courses/:course_id/pages",
+    "url:PUT|/api/v1/courses/:course_id/pages/:url_or_id",
+    "url:POST|/api/v1/conversations",
+    "url:POST|/api/v1/courses/:course_id/files",
+]
+
+
+async def _canvas_client_for_job(redis, job: CanvasJob) -> CanvasClient:
+    """Build the right Canvas client for a job.
+
+    Priority order (best-token-first):
+
+      1. **User-OAuth path** -- the job has a ``canvas_user_id`` AND we
+         have stored OAuth credentials for that user on this platform.
+         This is the only auth that works for the general Canvas REST
+         API in Canvas Cloud, and it authors the Page as that instructor.
+         Refreshes silently on 401.
+      2. **Service-token path** -- known platform but no user token.
+         Useful for LTI Advantage services (NRPS, AGS); does NOT work
+         for ``/api/v1/...`` calls in Canvas Cloud, so the bridge will
+         see 401s here. Logged as a warning.
+      3. **Env-token fallback** -- no platform association or no stored
+         credentials. Requires ``CANVAS_API_TOKEN`` to be set; raises
+         otherwise.
+    """
+    from ..canvas.user_oauth import get_user_token
+
+    platform_id = job.platform_id
+    if not platform_id and job.canvas_course_id:
+        platform_id = await get_platform_for_course(redis, job.canvas_course_id)
+
+    if platform_id:
+        platform = await get_platform(redis, platform_id)
+        if platform is not None:
+            # 1. Prefer the job's own uploader token when one is stored.
+            if job.canvas_user_id:
+                try:
+                    user_token = await get_user_token(
+                        redis, platform.platform_id, job.canvas_user_id,
+                    )
+                except Exception:
+                    user_token = None
+                if user_token is not None:
+                    return CanvasClient.from_user_token(
+                        redis, platform, job.canvas_user_id,
+                    )
+            # 2. Fall back to the COURSE OWNER's OAuth token. The job's
+            #    canvas_user_id is often the file's uploader (or a Canvas
+            #    numeric id) which has no stored token, whereas the course
+            #    owner is the instructor who actually completed the OAuth
+            #    consent — their token is valid and is what the watcher uses
+            #    to read the course. Without this, the bridge drops to the
+            #    LTI service token, which Canvas rejects with invalid_scope
+            #    for page/file writes (it can't carry url:POST scopes).
+            owner_id = await get_course_owner(redis, job.canvas_course_id)
+            if owner_id and owner_id != job.canvas_user_id:
+                try:
+                    owner_token = await get_user_token(
+                        redis, platform.platform_id, owner_id,
+                    )
+                except Exception:
+                    owner_token = None
+                if owner_token is not None:
+                    logger.info(
+                        "Job %s: using course-owner OAuth token (owner=%s); "
+                        "job uploader=%r had no stored token",
+                        job.reflow_job_id, owner_id, job.canvas_user_id,
+                    )
+                    return CanvasClient.from_user_token(redis, platform, owner_id)
+            # 3. No usable user token: fall back to service token. Works for
+            #    LTI Advantage svcs but 401s/invalid_scopes on REST writes.
+            logger.warning(
+                "Job %s has no stored user token (uploader=%r, owner=%r); "
+                "falling back to LTI Advantage service token (page/file "
+                "writes will fail with invalid_scope)",
+                job.reflow_job_id, job.canvas_user_id, owner_id,
+            )
+            return CanvasClient.from_platform(redis, platform, _BRIDGE_SCOPES)
+        logger.warning(
+            "Job %s references unknown platform_id=%r; falling back to env token",
+            job.reflow_job_id, platform_id,
+        )
+    return CanvasClient()
+
+logger = logging.getLogger(__name__)
+
+
+async def start_bridge(
+    redis: Redis,
+    *,
+    shutdown_event: asyncio.Event,
+    poll_interval_seconds: int | None = None,
+) -> None:
+    """Long-running task: drive in-flight jobs to completion.
+
+    Polls per job rather than subscribing to an event stream — simpler, and
+    the working set is small (a course's pending uploads).
+    """
+
+    interval = poll_interval_seconds or int(getattr(settings, "iris_poll_seconds", 30))
+    iris = IrisClient()
+    # The bridge used to share one CanvasClient process-wide. In
+    # multi-tenant mode each job may belong to a different Canvas
+    # instance, so we construct per-job inside _tick instead.
+    canvas: CanvasClient | None = None
+
+    while not shutdown_event.is_set():
+        try:
+            await _tick(redis, iris, canvas)
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("Bridge tick failed")
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+# The worker was Reflow-only when it was named; main.py and older operator
+# scripts import it by this name.
+start_reflow_bridge = start_bridge
+
+
+# Canvas-side states the bridge is allowed to poll/update. We
+# DELIBERATELY include ``awaiting_review`` and ``failed`` so the
+# bridge can correct stale state when Reflow disagrees later (e.g.
+# a late-arriving completion, a timeout-induced failure, or an ops
+# replay of a stuck job). ``page_failed`` is included so the bridge
+# keeps retrying the Canvas Page write on each tick — the conversion
+# already succeeded, so once the OAuth token gains the Pages scope the
+# page builds itself with no manual replay. The two we never touch are
+# ``published`` (faculty already approved — overwriting would lose their
+# decision) and ``rejected`` (faculty already declined — same rationale).
+_BRIDGE_POLLABLE: set[str] = {
+    "processing", "awaiting_review", "failed", "page_failed", "awaiting_approval",
+}
+
+# Hard ceiling on how long a single job may occupy the tick. The bridge's
+# job is to reflect Reflow status + (re)build one Canvas Page from an
+# ALREADY-converted document: fetch status, download a handful of figures,
+# upload them, and create/update one page. That should take seconds. If any
+# single network call wedges (a Canvas/S3 request with no effective timeout),
+# the whole sequential tick would otherwise block forever and strand every
+# job after it in 'processing'. Cap each job so the scan always moves on.
+_DRIVE_JOB_TIMEOUT_S = 180
+
+
+async def _tick(redis: Redis, iris: IrisClient, canvas: CanvasClient | None) -> None:
+    """One pass: move every non-terminal job one step closer to a page.
+
+    Bug history: an earlier filter (``job.status != "processing"``) meant
+    the bridge stopped watching a job the moment it moved out of
+    ``processing`` — so a late status change upstream never propagated, and
+    an ops manual replay that succeeded after the inline task had crashed
+    left the record stuck at ``failed`` forever. Wider filter + reflection
+    in the drive functions fixes that.
+    """
+
+    reflow = ReflowClient() if legacy_reflow_configured() else None
+    cursor = 0
+    while True:
+        cursor, keys = await redis.scan(cursor=cursor, match=tk("canvas:job:*"), count=100)
+        for raw_key in keys:
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            job_id = key.rsplit(":", 1)[-1]
+            job = await get_job(redis, job_id)
+            if job is None or job.status not in _BRIDGE_POLLABLE:
+                continue
+            if not job.is_iris and reflow is None and not await _has_legacy_snapshot(redis, job):
+                # A Reflow-era job with nothing to build from and no Reflow
+                # to ask: leave it exactly as it is.
+                continue
+            try:
+                job_canvas = await _canvas_client_for_job(redis, job)
+            except Exception:
+                logger.exception(
+                    "Could not build Canvas client for job %s; will retry next tick",
+                    job.reflow_job_id,
+                )
+                continue
+            # Uploads run outside the per-job time cap. Each one waits while
+            # Iris rasterizes the part, and cancelling an upload Iris already
+            # accepted would orphan a session we then upload (and pay for)
+            # again.
+            if job.is_iris and pending_parts(job) and (
+                job.status == "processing" or (job.status == "failed" and job.iris_stalled_at)
+            ):
+                try:
+                    await _upload_pending(redis, iris, job_canvas, job)
+                except Exception:
+                    logger.exception("Bridge: upload retry failed for %s", job.reflow_job_id)
+                    continue
+                job = await get_job(redis, job_id)
+                if job is None or job.status not in _BRIDGE_POLLABLE or pending_parts(job):
+                    continue
+            # Isolate each job: a hang times out, an error is logged, and the
+            # scan continues to the next job either way. Without this, one bad
+            # job stalls or aborts the whole tick and strands every job after
+            # it in 'processing' (observed: 4 pages rebuilt, then a 20-min hang).
+            try:
+                if job.is_iris:
+                    coro = _drive_iris_job(redis, iris, job_canvas, job)
+                elif reflow is not None:
+                    coro = _drive_reflow_job(redis, reflow, job_canvas, job)
+                else:
+                    coro = _drive_legacy_snapshot_job(redis, job_canvas, job)
+                await asyncio.wait_for(coro, timeout=_DRIVE_JOB_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning(
+                    "Bridge: job %s exceeded %ss; moving on (will retry next tick)",
+                    job.reflow_job_id, _DRIVE_JOB_TIMEOUT_S,
+                )
+            except Exception:
+                logger.exception(
+                    "Bridge: job %s failed to drive; moving on", job.reflow_job_id,
+                )
+        if cursor == 0:
+            break
+
+
+async def _has_legacy_snapshot(redis: Redis, job: CanvasJob) -> bool:
+    return (await get_legacy_markdown(redis, job.reflow_job_id)) is not None
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by ``_drive_job`` to build the Canvas Page artifact.
+#
+# These were lost in the transcript-based reconstruction of this file and
+# restored here with intentionally minimal behavior: do the obvious thing,
+# fail soft, and never block the job from advancing to ``awaiting_review``.
+# ---------------------------------------------------------------------------
+
+def _title_from_filename(filename: str | None) -> str:
+    """Clean filename into a human-friendly Canvas Page title.
+
+    Strips the source extension (.pdf / .docx / etc.) and trims
+    whitespace. Falls back to ``"Document"`` when filename is empty.
+    """
+    if not filename:
+        return "Document"
+    name = str(filename).strip()
+    for ext in (".pdf", ".docx", ".doc", ".pptx", ".ppt", ".html", ".htm", ".epub"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name.strip() or "Document"
+
+
+def _canvas_file_url(job: CanvasJob) -> str | None:
+    """Best-effort URL to the original source file in Canvas.
+
+    The bridge worker doesn't always know the institutional host
+    (e.g. the legacy single-tenant path doesn't carry a platform).
+    When we can't build a confident URL we return ``None`` -- the
+    renderer treats ``None`` as "no source link" and just omits it
+    from the rendered HTML.
+    """
+    course_id = getattr(job, "canvas_course_id", None)
+    file_id = getattr(job, "canvas_file_id", None)
+    if not course_id or not file_id:
+        return None
+    # Build a path-only link; the panorama overlay rewrites these in
+    # the browser using ``window.location.origin``, which is exactly
+    # the Canvas host the user is currently on. That way the same
+    # rendered HTML works for any institution it's served to.
+    return f"/courses/{course_id}/files/{file_id}"
+
+
+def choose_page_body(
+    *,
+    rendered_html: str,
+    title: str,
+    accessible_url: str,
+    original_pdf_url: str | None,
+    inline_cap: int,
+    generator: str = REFLOW_GENERATOR,
+) -> tuple[str, str]:
+    """Pick what actually goes in the Canvas Page body.
+
+    Returns ``(body_html, mode)`` where mode is ``"inline"`` or ``"stub"``.
+
+    Inline is the preferred outcome: the accessible document *is* the Canvas
+    Page, so it renders in the course with no second tab, works in the Canvas
+    mobile apps, and keeps working if the connector is down.
+
+    Canvas rejects Page bodies over 511,999 characters with HTTP 400
+    ("is too long"). ``inline_cap`` sits below that with headroom; anything
+    larger falls back to a link stub pointing at the tool-served HTML, which
+    is tiny and always writes cleanly.
+
+    ``inline_cap <= 0`` forces stub mode, which is the escape hatch if an
+    institution's Canvas turns out to behave differently.
+    """
+    if inline_cap > 0 and len(rendered_html) <= inline_cap:
+        return rendered_html, "inline"
+    return (
+        render_link_stub(
+            title=title,
+            accessible_url=accessible_url,
+            original_pdf_url=original_pdf_url,
+            generator=generator,
+        ),
+        "stub",
+    )
+
+
+async def _notify_professor(canvas: CanvasClient, job: CanvasJob) -> None:
+    """Best-effort: drop a Canvas Conversation announcing the new draft.
+
+    We try once, log on failure, and move on. The faculty member
+    will see the dial in the panorama overlay anyway -- this
+    notification is just a courtesy when their inbox is where they
+    notice things.
+
+    NOTE: this is a stub. The historical implementation called
+    ``canvas.create_conversation(...)`` against a small set of
+    recipients. After the file-recovery regression that original
+    body was lost; the simplest no-regression behavior is to log a
+    debug line and skip until the helper is re-fleshed.
+    """
+    try:
+        recipient = getattr(job, "canvas_user_id", "") or "(unknown)"
+        logger.debug(
+            "Bridge: would notify professor user=%s about job=%s "
+            "(notification helper is a stub; faculty will still see "
+            "the dial in the panorama overlay)",
+            recipient, job.reflow_job_id,
+        )
+    except Exception:  # pragma: no cover -- belt + suspenders
+        logger.exception("notify_professor stub raised; ignoring")
+
+
+async def _drive_reflow_job(
+    redis: Redis,
+    reflow: ReflowClient,
+    canvas: CanvasClient,
+    job: CanvasJob,
+) -> None:
+    """Legacy: reflect Reflow's current status onto a Reflow-era job.
+
+    Only runs while ``REFLOW_API_BASE_URL`` is still configured, so documents
+    that were mid-conversion in Reflow at the switch can finish there.
+
+    Allowed transitions, by current canvas state:
+      * canvas=processing/failed + reflow=completed -> canvas=awaiting_review
+        (continues into the Page + notify block below)
+      * canvas=processing/awaiting_review + reflow=failed/denied -> canvas=failed
+      * canvas=awaiting_review + reflow=completed -> no-op (already there)
+      * canvas=failed + reflow still in-flight -> no-op (give it time)
+
+    We intentionally never overwrite ``published`` or ``rejected`` —
+    those are human-decided terminal states, see ``_BRIDGE_POLLABLE``.
+    """
+    # A faculty member who deletes the PDF expects it gone. Without this
+    # check the record survives its source and the bridge keeps retrying a
+    # document that no longer exists — which is how a deleted file went on
+    # producing 403s every thirty seconds. Only an explicit 404 purges:
+    # a network blip or an expired token must never delete anyone's record.
+    if job.canvas_file_id:
+        try:
+            await canvas.get_file_metadata(job.canvas_file_id)
+        except CanvasApiError as exc:
+            if exc.status_code == 404:
+                logger.info(
+                    "Bridge: canvas file %s is gone; purging job %s (%s)",
+                    job.canvas_file_id, job.reflow_job_id, job.canvas_file_name,
+                )
+                await purge_job(redis, job)
+                return
+            # Anything else is a transient or auth problem. Leave the
+            # record alone and let the normal error handling below run.
+
+    status = await reflow.get_status(job.reflow_job_id)
+    state = (status.get("status") or "").lower()
+
+    if state in {"failed", "denied"}:
+        if job.status != "failed":
+            prior = job.status
+            job.status = "failed"
+            job.error = status.get("error", f"Reflow status: {state}")
+            await put_job(redis, job)
+            logger.warning(
+                "Bridge: job %s flipped %s->failed (reflow=%s, err=%s)",
+                job.reflow_job_id, prior, state, job.error,
+            )
+        return
+
+    if state == "completed":
+        # No-op only if a Canvas Page actually exists. A job stranded at
+        # awaiting_review with no page id/url is a victim of the old
+        # "best-effort page write" behavior (the write failed but the status
+        # advanced anyway), so faculty saw a clean dial but students got no
+        # page. Fall through and (re)build it — this self-heals those legacy
+        # jobs on the next tick once Pages access is in place, with no manual
+        # replay. A genuinely-built awaiting_review job keeps its page id and
+        # is left alone (faculty owns the next transition).
+        if job.status == "awaiting_review" and (job.canvas_page_id or job.canvas_page_url):
+            return
+        # Otherwise fall through to the completion block which moves
+        # canvas to awaiting_review and tries to create the Page.
+    elif state == "awaiting_approval":
+        # Reflow paused for a PII/privacy decision. Reflect that onto the
+        # canvas status instead of leaving it 'processing' — otherwise the
+        # timeout watchdog mislabels it "stuck in processing for >3600s" and
+        # tells faculty to re-upload, when the real action is a one-click
+        # Approve/Deny. The overlay shows that prompt for this status. We keep
+        # polling (it's in _BRIDGE_POLLABLE), so once approved Reflow resumes
+        # to completed and the next tick builds the page.
+        if job.status != "awaiting_approval":
+            job.status = "awaiting_approval"
+            job.error = None
+            await put_job(redis, job)
+        return
+    else:
+        # Reflow is still working (pii_scanning / processing*); nothing to write.
+        return
+
+    # The completed status payload carries the result URLs directly —
+    # there is no separate /result endpoint on the Reflow API.
+    markdown_url = status.get("markdown_url") or status.get("result_url")
+    if not markdown_url:
+        logger.warning("Reflow job %s completed without markdown_url", job.reflow_job_id)
+        return
+    markdown = await reflow.fetch_markdown(markdown_url)
+
+    # Derive per-document conversion-quality signals from the markdown
+    # we just received. These replace the (always-empty) ``signals``
+    # field upstream Reflow doesn't populate and give the panorama
+    # dial something honest to display.
+    try:
+        from ..canvas.signals import derive_signals_from_markdown
+        job.signals = derive_signals_from_markdown(
+            markdown,
+            pdf_classification=status.get("pdf_classification"),
+            ocr_was_run=bool(status.get("ocr_applied") or status.get("ocr_was_run")),
+        )
+        logger.info(
+            "Bridge: derived signals for job=%s (headings=%d, images=%d/%d, tables=%d)",
+            job.reflow_job_id,
+            len(job.signals.get("heading_levels") or []),
+            job.signals.get("images_with_alt") or 0,
+            job.signals.get("images_total") or 0,
+            job.signals.get("tables_total") or 0,
+        )
+    except Exception:  # noqa: BLE001 — signal derivation is best-effort
+        logger.exception("Bridge: signal derivation failed for %s", job.reflow_job_id)
+        job.signals = None
+
+    # Figures land in S3 with short-lived presigned URLs that expire, so we
+    # can't embed them in a permanent Canvas Page. Instead, point every
+    # ``<img>`` at our stable figure-proxy route, which regenerates S3 access
+    # server-side on each request. The Canvas Page is served from Canvas's
+    # origin, so the src must be ABSOLUTE (use LTI_PUBLIC_URL).
+    # Make the Canvas Page self-contained: upload each figure into a course
+    # folder and rewrite the markdown's relative ``figures/<id>.png`` refs to
+    # Canvas's own file URLs. This decouples the page from the tunnel and the
+    # Reflow backend -- it keeps rendering even if either is down (the old
+    # figure-proxy approach broke whenever the public hostname rotated).
+    # Reflow serializes figures under ``figures`` (list of {figure_id, url});
+    # ``stored_figures`` is the internal Redis field, not in the API response.
+    figures = status.get("figures") or status.get("stored_figures") or []
+    # Seed from any figures we already uploaded on a prior tick (a page_failed
+    # retry). Reusing the stored Canvas URLs means a job that keeps retrying the
+    # page write doesn't re-download from S3 and re-POST to Canvas every ~30s.
+    figure_canvas_urls: dict[str, str] = dict(getattr(job, "figure_canvas_urls", None) or {})
+
+    # Fetch the source PDF once so we can pull figure bytes directly from
+    # it — Reflow's S3 copies carry a vision-pipeline tile grid baked in,
+    # while the PDF's own embedded rasters are the original clean
+    # imagery. The download is gated on there being at least one figure
+    # that isn't already in figure_canvas_urls (otherwise the existing
+    # map covers everything and the PDF fetch is wasted work).
+    needs_pdf = any(
+        f"figures/{str(f.get('figure_id') or '').strip()}.png" not in figure_canvas_urls
+        for f in figures
+        if str(f.get("figure_id") or "").strip()
+    )
+    pdf_bytes: bytes | None = None
+    if needs_pdf and figures:
+        try:
+            pdf_bytes = await canvas.download_file(job.canvas_file_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Bridge: PDF download failed for figure extraction (job %s, file %s)",
+                job.reflow_job_id, job.canvas_file_id,
+            )
+
+    for fig in figures:
+        fid = str(fig.get("figure_id") or "").strip()
+        src = str(fig.get("url") or "").strip()
+        if not fid or not src:
+            continue
+        ref = f"figures/{fid}.png"
+        if ref in figure_canvas_urls:
+            # Already uploaded on an earlier tick — just rewrite the markdown.
+            markdown = markdown.replace(ref, figure_canvas_urls[ref])
+            continue
+        # Reflow numbers figures PER DOCUMENT ("figure-1", "figure-2", ...), so
+        # the bare "{fid}.png" name collides across files in the shared folder.
+        # With Canvas's on_duplicate=overwrite, every PDF's "figure-1.png"
+        # overwrites the previous one and they all resolve to whichever file
+        # uploaded last -- images bleed across pages. Prefix with the stable
+        # Canvas source-file id: unique across files, stable across re-converts
+        # (so re-running a single file still overwrites its own figures, not a
+        # neighbour's). ``ref`` stays the per-document markdown key.
+        canvas_fig_name = f"{job.canvas_file_id}-{fid}.png"
+        try:
+            # Prefer the PDF-extracted bytes (no vision-pipeline grid).
+            # Fall back to Reflow's S3 PNG when the figure isn't an
+            # embedded raster (e.g., a vector chart) — better to ship
+            # the gridded copy than to drop the figure entirely.
+            figure_bytes: bytes | None = None
+            content_type = "image/png"
+            if pdf_bytes is not None:
+                from ..canvas.pdf_figures import (
+                    PdfFigureNotFoundError,
+                    extract_figure_for_reflow_id,
+                )
+                try:
+                    extracted = extract_figure_for_reflow_id(pdf_bytes, figures, fid)
+                    figure_bytes = extracted.image_bytes
+                    content_type = extracted.content_type
+                except PdfFigureNotFoundError as exc:
+                    logger.info(
+                        "Bridge: PDF extraction skipped for job %s fig %s: %s",
+                        job.reflow_job_id, fid, exc,
+                    )
+            if figure_bytes is None:
+                fetch_url = rewrite_presigned_url(src)
+                async with httpx.AsyncClient(timeout=60.0) as hc:
+                    img_resp = await hc.get(fetch_url, follow_redirects=True)
+                img_resp.raise_for_status()
+                figure_bytes = img_resp.content
+
+            uploaded = await canvas.upload_course_file(
+                job.canvas_course_id,
+                canvas_fig_name,
+                figure_bytes,
+                content_type=content_type,
+                folder_path=_FIGURE_FOLDER,
+            )
+            canvas_url = str(uploaded.get("url") or "")
+            if canvas_url:
+                figure_canvas_urls[ref] = canvas_url
+                markdown = markdown.replace(ref, canvas_url)
+        except Exception:  # noqa: BLE001 — one bad figure shouldn't sink the page
+            logger.exception(
+                "Bridge: failed to upload figure %s to Canvas for job %s",
+                fid, job.reflow_job_id,
+            )
+    if figure_canvas_urls:
+        # Persist the map so the overlay's accessible-HTML views embed the
+        # same Canvas-hosted images (they have no proxy to fall back on).
+        job.figure_canvas_urls = figure_canvas_urls
+        logger.info(
+            "Bridge: uploaded %d/%d figures to Canvas folder %r for job %s",
+            len(figure_canvas_urls), len(figures), _FIGURE_FOLDER, job.reflow_job_id,
+        )
+
+    title = _title_from_filename(job.canvas_file_name)
+
+    # ``image_base_url=None``: figure refs are already absolute Canvas URLs
+    # after the rewrite above, so no further path rewriting is needed.
+    rendered = render(
+        markdown,
+        title=title,
+        image_base_url=None,
+        original_pdf_url=_canvas_file_url(job),
+        generator=REFLOW_GENERATOR,
+    )
+    await _write_canvas_page(redis, canvas, job, rendered, generator=REFLOW_GENERATOR)
+
+
+async def _write_canvas_page(
+    redis: Redis,
+    canvas: CanvasClient,
+    job: CanvasJob,
+    rendered: RenderedPage,
+    *,
+    generator: str,
+) -> None:
+    """Create or update the job's Canvas Page and move it to awaiting_review."""
+    # Write the converted document straight INTO the Canvas Page when it fits.
+    #
+    # This used to always publish a tiny stub that linked out to tool-served
+    # HTML, on the belief that a Canvas Cloud edge WAF rejected Page writes
+    # above ~8KB. That turned out to be wrong: there is no WAF *size* rule on
+    # this path. The only ceiling is Canvas's own application limit of 511,999
+    # characters, which returns a clean HTTP 400 ("is too long (maximum is
+    # 511,999 characters)") rather than a CloudFront 403. At ~1.8KB of rendered
+    # HTML per PDF page that's roughly 280 pages, so essentially every real
+    # course document fits inline.
+    #
+    # Edge *content* rules are a different matter and do exist on some Canvas
+    # Cloud deployments — they reject the request before Canvas sees it and
+    # answer with an HTML 403 that is easily mistaken for a permissions error.
+    # See docs/TROUBLESHOOTING.md; the renderer already defuses the one
+    # signature we have hit in practice.
+    #
+    # Inline is strictly better for students: the accessible version IS the
+    # Canvas Page, so it renders in the course, needs no new tab, works in the
+    # Canvas mobile apps, and survives the tool being offline.
+    #
+    # The stub remains as a fallback for documents past the threshold. Figures
+    # are already uploaded to Canvas Files and referenced by absolute Canvas
+    # URLs (see the figure loop above), so the body carries markup only.
+    #
+    # The approval gate is unaffected: the Page is created unpublished and only
+    # published after faculty approve, so students can't see either form early.
+    public_base = (getattr(settings, "lti_public_url", "") or "").rstrip("/")
+    accessible_url = f"{public_base}/canvas/panorama/alt/{job.reflow_job_id}/html"
+    inline_cap = int(getattr(settings, "canvas_page_inline_max_chars", 400_000))
+    page_body, page_mode = choose_page_body(
+        rendered_html=rendered.html,
+        title=rendered.title,
+        accessible_url=accessible_url,
+        original_pdf_url=_canvas_file_url(job),
+        inline_cap=inline_cap,
+        generator=generator,
+    )
+    if page_mode == "inline":
+        logger.info(
+            "Bridge: publishing %s inline (%d chars, cap %d) for job %s",
+            rendered.title, len(rendered.html), inline_cap, job.reflow_job_id,
+        )
+    else:
+        logger.warning(
+            "Bridge: %s is %d chars, over the %d inline cap — falling back to "
+            "the link stub for job %s",
+            rendered.title, len(rendered.html), inline_cap, job.reflow_job_id,
+        )
+
+    # Reuse ONE stable page per file. The bridge used to POST a new page on
+    # every (re)conversion, so Canvas accumulated duplicate "…-2/-3/…" pages.
+    # Now we look up the slug we created for this file last time and PUT-update
+    # it; we only create when none exists (or the update 404s). ``page_ref``
+    # falls back to the deterministic slug Canvas derives from the title, so
+    # the first run after this change reuses the original page instead of
+    # adding yet another duplicate. If the token lacks manage_wiki (401/403),
+    # we mark page_failed below rather than faking awaiting_review.
+    page_ref = await get_file_page(redis, job.canvas_course_id, job.canvas_file_id)
+    if not page_ref:
+        page_ref = _slugify(rendered.title)
+    try:
+        try:
+            page = await canvas.update_page(
+                job.canvas_course_id, page_ref, rendered.title, page_body,
+            )
+        except CanvasApiError as exc:
+            if exc.status_code == 404:
+                page = await canvas.create_page(
+                    job.canvas_course_id,
+                    rendered.title,
+                    page_body,
+                    published=False,
+                )
+            else:
+                raise
+        job.canvas_page_id = str(page.get("page_id", ""))
+        # Store the full, openable page URL (``html_url``) for the overlay's
+        # "Open accessible Canvas page" link. Canvas's ``url`` field is only
+        # the bare slug, which rendered as a link 404s (it resolves to
+        # /courses/<id>/<slug> instead of /courses/<id>/pages/<slug>).
+        # publish_page/delete_page normalize whichever form they're given.
+        job.canvas_page_url = str(page.get("html_url") or page.get("url") or "")
+        # Remember the slug so the next re-conversion updates this same page.
+        await put_file_page(
+            redis,
+            job.canvas_course_id,
+            job.canvas_file_id,
+            str(page.get("url") or job.canvas_page_url),
+        )
+    except CanvasApiError as exc:
+        if exc.status_code in (401, 403):
+            # The conversion succeeded but Canvas rejected the page write.
+            # DON'T advance to awaiting_review: that strands the job claiming
+            # success with no page ever created (the "pages never got made"
+            # bug). Mark it page_failed so the overlay shows the real reason;
+            # page_failed is pollable, so the next tick retries and the page
+            # self-heals once the underlying cause is fixed.
+            #
+            # This message used to assert a missing Pages scope as the cause.
+            # It is one cause among several — a locked page, a page the token
+            # may update but not create, a course-level restriction — and
+            # stating a guess as fact sent a whole afternoon's debugging in
+            # the wrong direction. Report what Canvas said and let the reader
+            # draw the conclusion.
+            logger.warning(
+                "Canvas page write FAILED for job %s (page=%s, status=%d): %s. "
+                "Canvas said: %s. Marking page_failed; it retries every tick "
+                "and republishes once the cause is resolved.",
+                job.reflow_job_id, page_ref, exc.status_code, exc.message,
+                exc.body or "(no response body)",
+            )
+            job.canvas_page_id = ""
+            job.canvas_page_url = ""
+            job.status = "page_failed"
+            job.error = f"Canvas page write {exc.status_code}: {exc.message}"
+            await put_job(redis, job)
+            return
+        raise
+
+    job.status = "awaiting_review"
+    job.error = None  # clear any prior page_failed error now that the page exists
+    await put_job(redis, job)
+
+    # Notify the uploader only when we have a Canvas Page to point at;
+    # otherwise the Conversations message would be useless.
+    if job.canvas_page_id:
+        await _notify_professor(canvas, job)
+
+
+
+# ---------------------------------------------------------------------------
+# Iris jobs
+# ---------------------------------------------------------------------------
+
+async def _upload_pending(
+    redis: Redis, iris: IrisClient, canvas: CanvasClient, job: CanvasJob,
+) -> None:
+    """Upload the parts of ``job`` Iris could not take when it was created.
+
+    Re-downloads the file from Canvas (the connector never stores source
+    documents) and checks it is still the document the job was planned
+    for: the parts already in Iris were cut from those bytes, and stitching
+    them to parts of a different file would be nonsense.
+    """
+    if await upload_backoff_active(redis):
+        return
+    if not await acquire_upload_lock(redis, job.reflow_job_id):
+        return  # the watcher (or an earlier tick) is uploading right now
+    try:
+        fresh = await get_job(redis, job.reflow_job_id)
+        if fresh is None or not pending_parts(fresh):
+            return
+        stalled = fresh.status == "failed" and bool(fresh.iris_stalled_at)
+        if fresh.status != "processing" and not stalled:
+            return
+        job = fresh
+        try:
+            content = await canvas.download_file(job.canvas_file_id)
+        except CanvasApiError as exc:
+            if exc.status_code == 404 and await _file_is_gone(canvas, job.canvas_file_id):
+                # Deleted in Canvas: nothing left to convert or to show.
+                logger.info(
+                    "Bridge: canvas file %s is gone; purging job %s (%s)",
+                    job.canvas_file_id, job.reflow_job_id, job.canvas_file_name,
+                )
+                await purge_job(redis, job)
+                return
+            raise
+        import hashlib
+
+        if job.source_sha256 and hashlib.sha256(content).hexdigest() != job.source_sha256:
+            # A new version replaced the file mid-conversion. The parts
+            # already in Iris were cut from the old bytes and cannot be
+            # stitched to new ones, so start over: forget this job and let
+            # the watcher convert the file as it is now.
+            logger.info(
+                "Bridge: file %s changed during conversion; restarting job %s",
+                job.canvas_file_id, job.reflow_job_id,
+            )
+            await clear_processed(redis, job.canvas_course_id, job.canvas_file_id)
+            await purge_job(redis, job)
+            return
+        try:
+            prepared = await asyncio.to_thread(prepare_document, job.canvas_file_name, content)
+        except DocumentPrepError as exc:
+            job.status = "failed"
+            job.error = str(exc)
+            job.iris_stalled_at = None
+            await put_job(redis, job)
+            return
+        def uploaded() -> int:
+            return sum(1 for p in job.iris_parts or [] if p.get("session_id"))
+
+        before = uploaded()
+        await upload_pending_parts(redis, iris, job, prepared.pdf_bytes)
+        if stalled and job.status == "failed" and job.iris_stalled_at and uploaded() > before:
+            # Iris is back and took a part: the sweeper's verdict was wrong.
+            job.status = "processing"
+            job.error = None
+            job.iris_stalled_at = None
+            await put_job(redis, job)
+    finally:
+        await release_upload_lock(redis, job.reflow_job_id)
+
+
+async def _file_is_gone(canvas: CanvasClient, file_id: str) -> bool:
+    """Only Canvas saying the file does not exist counts (a download can
+    also "404" on a file with no download URL, which still exists)."""
+    try:
+        await canvas.get_file_metadata(file_id)
+    except CanvasApiError as exc:
+        return exc.status_code == 404
+    return False
+
+
+async def _drive_iris_job(
+    redis: Redis,
+    iris: IrisClient,
+    canvas: CanvasClient,
+    job: CanvasJob,
+) -> None:
+    """Move an Iris job one step: poll, complete, then build its page.
+
+    Transitions, by where the job is:
+      * parts still in Iris (queued/running)   -> nothing to write yet
+      * a part failed, or Iris lost it          -> canvas=failed, with Iris's reason
+      * every part ready, document not stored   -> fetch + stitch + store
+      * document stored, no Canvas Page yet     -> build the page -> awaiting_review
+      * awaiting_review with a page             -> nothing (faculty decide next)
+
+    ``published`` and ``rejected`` are never touched (``_BRIDGE_POLLABLE``).
+    """
+    # A faculty member who deletes the PDF expects it gone. Only an explicit
+    # 404 purges: a network blip or an expired token must never delete
+    # anyone's record.
+    if job.canvas_file_id:
+        try:
+            await canvas.get_file_metadata(job.canvas_file_id)
+        except CanvasApiError as exc:
+            if exc.status_code == 404:
+                logger.info(
+                    "Bridge: canvas file %s is gone; purging job %s (%s)",
+                    job.canvas_file_id, job.reflow_job_id, job.canvas_file_name,
+                )
+                await purge_job(redis, job)
+                return
+
+    if job.status == "awaiting_review" and (job.canvas_page_id or job.canvas_page_url):
+        return
+
+    if not job.completed_at:
+        # A failure Iris reported is final until someone asks again ("Create
+        # accessible page"); only a job the sweeper gave up on while Iris was
+        # silent is worth checking on every tick.
+        if job.status == "failed" and not job.iris_stalled_at:
+            return
+        if job.status not in ("processing", "failed"):
+            return
+        if not job.iris_parts or pending_parts(job) or await upload_locked(redis, job.reflow_job_id):
+            return
+        try:
+            state = await poll_parts(redis, iris, job)
+        except IrisApiError as exc:
+            logger.warning("Bridge: could not poll Iris for %s: %s", job.reflow_job_id, exc)
+            return
+        if state.failed:
+            # Lost parts reset alongside stay pending; "Try again" sends them
+            # with the failed ones instead of paying for them now.
+            if job.status != "failed" or job.error != state.error or job.iris_stalled_at:
+                job.status = "failed"
+                job.error = state.error
+                job.iris_stalled_at = None
+                await put_job(redis, job)
+                logger.warning("Bridge: Iris job %s failed: %s", job.reflow_job_id, state.error)
+            return
+        if state.resent:
+            return  # lost parts go back to Iris on the next tick
+        if job.iris_stalled_at and (state.in_flight or state.finished):
+            logger.info("Bridge: Iris is working on %s again; resuming", job.reflow_job_id)
+            job.status = "processing"
+            job.error = None
+            job.iris_stalled_at = None
+            await put_job(redis, job)
+        if not state.finished:
+            return
+        if not await complete_job(redis, iris, job):
+            return
+
+    if job.status not in ("processing", "failed", "page_failed", "awaiting_review"):
+        return
+    await _resolve_iris_figures(redis, canvas, job)
+    try:
+        rendered = await load_rendered(redis, job, original_pdf_url=_canvas_file_url(job))
+    except ContentUnavailableError as exc:
+        logger.warning("Bridge: no content for %s yet: %s", job.reflow_job_id, exc.message)
+        return
+    await _write_canvas_page(redis, canvas, job, rendered, generator=IRIS_GENERATOR)
+
+
+async def _resolve_iris_figures(redis: Redis, canvas: CanvasClient, job: CanvasJob) -> None:
+    """Lift each figure Iris described out of the source PDF into Canvas.
+
+    Iris reads rasterized pages and cannot return image files, so every
+    ``<img>`` it writes is a placeholder naming its page. The pixels come
+    from the PDF itself (:func:`connector.canvas.pdf_figures.extract_iris_figures`)
+    and are uploaded to the course's figure folder, the way Reflow's figures
+    were. A figure that cannot be matched unambiguously is recorded as
+    unmatched and rendered as its description; one whose upload failed is
+    retried on the next attempt.
+    """
+    figures = figures_from_manifest(job.iris_figures)
+    urls: dict[str, str] = dict(job.figure_canvas_urls or {})
+    unmatched = set(job.iris_figures_unmatched or [])
+    todo = [f for f in figures if f.page and f.ref not in urls and f.ref not in unmatched]
+    if not todo:
+        return
+    # An attempt that uploads nothing (the download or every upload failed,
+    # or it ran out of time first) waits before the next one, and after a
+    # few the rest are shown as their descriptions: a page Canvas keeps
+    # refusing is rebuilt every tick, and each attempt downloads the source
+    # (and re-runs LibreOffice for Office files) again. Any upload that
+    # succeeds resets the count, so a figure-heavy document that keeps
+    # running into the per-job time cap still finishes.
+    retry_key = IRIS_FIGURES_RETRY_KEY.format(job_id=job.reflow_job_id)
+    if await redis.exists(retry_key):
+        return
+    attempts_key = IRIS_FIGURES_ATTEMPTS_KEY.format(job_id=job.reflow_job_id)
+    attempts = int(await redis.incr(attempts_key))
+    await redis.expire(attempts_key, 7 * 86400)
+    if attempts > _FIGURE_MAX_ATTEMPTS:
+        job.iris_figures_unmatched = sorted(unmatched | {f.ref for f in todo})
+        await put_job(redis, job)
+        logger.warning(
+            "Bridge: giving up on %d figure(s) for job %s after %d attempts; "
+            "they show as their descriptions",
+            len(todo), job.reflow_job_id, attempts - 1,
+        )
+        return
+    try:
+        content = await canvas.download_file(job.canvas_file_id)
+        pdf_bytes = content
+        if is_office_document(job.canvas_file_name):
+            from ..canvas.iris_documents import office_to_pdf
+
+            pdf_bytes = await asyncio.to_thread(office_to_pdf, job.canvas_file_name, content)
+    except Exception:  # noqa: BLE001 - figures are best-effort; the page builds without them
+        logger.exception(
+            "Bridge: could not fetch the source for figure extraction (job %s)", job.reflow_job_id,
+        )
+        await redis.set(retry_key, "1", ex=_FIGURE_RETRY_SECONDS)
+        return
+
+    from ..canvas.pdf_figures import extract_iris_figures
+
+    wanted_pages = {f.page for f in todo}
+    by_page: dict[int, list[tuple[str, bool]]] = {}
+    for f in figures:
+        if f.page in wanted_pages:
+            by_page.setdefault(int(f.page), []).append((f.ref, f.decorative))
+    try:
+        extracted = await asyncio.to_thread(extract_iris_figures, pdf_bytes, by_page)
+    except Exception:  # noqa: BLE001 - an unreadable PDF must not block the page forever
+        logger.exception("Bridge: figure matching failed for job %s", job.reflow_job_id)
+        extracted = {}
+
+    uploaded = 0
+    failed = 0
+    for f in todo:
+        fig = extracted.get(f.ref)
+        if fig is None:
+            unmatched.add(f.ref)
+            continue
+        ext = {"image/jpeg": "jpg", "image/gif": "gif"}.get(fig.content_type, "png")
+        # Prefixed with the Canvas file id: figure refs are per document, and
+        # every document's "p1-1" would otherwise overwrite the last one in
+        # the shared folder (the image-bleed bug the Reflow path once had).
+        name = f"{job.canvas_file_id}-{f.ref.removeprefix('figures/').rsplit('.', 1)[0]}.{ext}"
+        try:
+            result = await canvas.upload_course_file(
+                job.canvas_course_id, name, fig.image_bytes,
+                content_type=fig.content_type, folder_path=_FIGURE_FOLDER,
+            )
+        except Exception:  # noqa: BLE001 - one bad figure shouldn't sink the page
+            logger.exception("Bridge: figure upload failed for %s (%s)", job.reflow_job_id, f.ref)
+            failed += 1
+            continue
+        canvas_url = str(result.get("url") or "")
+        if not canvas_url:
+            failed += 1
+        if canvas_url:
+            urls[f.ref] = canvas_url
+            uploaded += 1
+            if uploaded == 1:
+                await redis.delete(attempts_key)  # progress: start counting afresh
+            # Saved as we go: a figure-heavy document can run into the
+            # per-job time cap, and the next tick should resume, not
+            # upload everything again.
+            job.figure_canvas_urls = urls
+            await put_job(redis, job)
+    job.figure_canvas_urls = urls
+    job.iris_figures_unmatched = sorted(unmatched)
+    await put_job(redis, job)
+    if failed and not uploaded:
+        await redis.set(retry_key, "1", ex=_FIGURE_RETRY_SECONDS)
+    logger.info(
+        "Bridge: job %s figures — %d uploaded, %d shown as descriptions, %d already done, "
+        "%d to retry",
+        job.reflow_job_id, uploaded, len(unmatched), len(urls) - uploaded, failed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reflow-era jobs once Reflow is gone
+# ---------------------------------------------------------------------------
+
+async def _drive_legacy_snapshot_job(
+    redis: Redis, canvas: CanvasClient, job: CanvasJob,
+) -> None:
+    """Rebuild a Reflow-era job's page from its migrated snapshot.
+
+    Only reached when someone asked for a page (the overlay's "Create
+    accessible page" resets the job to ``processing``) or a page write had
+    failed; a job that already has its page is left alone.
+    """
+    if job.status == "awaiting_review" and (job.canvas_page_id or job.canvas_page_url):
+        return
+    if job.status not in ("processing", "page_failed"):
+        return
+    try:
+        rendered = await load_rendered(redis, job, original_pdf_url=_canvas_file_url(job))
+    except ContentUnavailableError as exc:
+        job.status = "failed"
+        job.error = exc.message
+        await put_job(redis, job)
+        return
+    await _write_canvas_page(redis, canvas, job, rendered, generator=REFLOW_GENERATOR)
