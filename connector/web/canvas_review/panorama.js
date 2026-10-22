@@ -22,6 +22,11 @@
   var ORIGIN = (function () { if (!SCRIPT) return ""; try { return new URL(SCRIPT.src).origin; } catch (_) { return ""; } })();
   var INST = (function () { if (!SCRIPT) return ""; try { return new URL(SCRIPT.src).searchParams.get("inst") || ""; } catch (_) { return ""; } })();
   if (!ORIGIN || !INST) { console.warn("[iris] panorama.js loaded without origin/inst; aborting"); return; }
+  // One overlay per page, however many loaders include this file (a theme
+  // can carry an old loader and a new one at once while it moves from one
+  // to the other): every copy would put its own dial on every link.
+  if (window.__irisPanoramaLoaded) return;
+  window.__irisPanoramaLoaded = true;
 
   var STATE = { courseId: null, userRole: null, scoresByFilename: null, csrfToken: null, oauth: null };
   // File extensions Reflow can process. Mirrors the watcher's _CONVERTIBLE_EXTS
@@ -2348,6 +2353,29 @@
     // Page. These are keyed by job id and show the OUTPUT (WCAG) score.
     var accLinks = findAccessibleLinks();
 
+    // Claim everything found before waiting on the network. A scan used to
+    // mark an element only once its scores arrived, so a second scan
+    // started meanwhile (any change to the page schedules one) found the
+    // same link again and both added a dial: three dials on one link.
+    // What ends up without a dial is released at the end, so a later scan
+    // can try it again, as before.
+    var claimed = []
+      .concat(rows.map(function (e) { return e.row; }))
+      .concat(moduleItems.map(function (e) { return e.item; }))
+      .concat(anchors.map(function (e) { return e.anchor; }))
+      .concat(accLinks.map(function (e) { return e.anchor; }));
+    claimed.forEach(function (el) { el.dataset.reflowDecorated = "pending"; });
+    try {
+      await _decorateFound(rows, moduleItems, anchors, accLinks);
+    } finally {
+      claimed.forEach(function (el) {
+        if (el.dataset.reflowDecorated === "pending") delete el.dataset.reflowDecorated;
+      });
+    }
+  }
+
+  async function _decorateFound(rows, moduleItems, anchors, accLinks) {
+
     var byNamePromise = (rows.length || moduleItems.length)
       ? loadScoresByFilename()
       : Promise.resolve({});
@@ -2548,11 +2576,17 @@
   function scheduleScan() {
     if (scheduleScan._pending) return;
     scheduleScan._pending = true;
-    // Coalesce burst mutations into a single scan ~250ms later.
+    // Coalesce burst mutations into a single scan ~250ms later, and never
+    // run two at once: a change during a scan asks for one more after it.
     setTimeout(function () {
       scheduleScan._pending = false;
+      if (scheduleScan._running) { scheduleScan._again = true; return; }
+      scheduleScan._running = true;
       decorateAllPdfs().catch(function (e) {
         console.warn("Iris overlay scan failed:", e);
+      }).then(function () {
+        scheduleScan._running = false;
+        if (scheduleScan._again) { scheduleScan._again = false; scheduleScan(); }
       });
     }, 250);
   }

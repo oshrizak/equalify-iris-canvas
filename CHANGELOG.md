@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   top-level heading; a document with its own H1 now keeps it as the only
   one, and its text becomes the page title. The Immersive Reader declares
   the document's language instead of always English.
+- **A link could get two or three dials.** The overlay marked a link only
+  once its scores came back, so a second scan started meanwhile (any change
+  to the page starts one) found the same link and added its own dial. Scans
+  now claim what they find first and never run two at once, and a second
+  copy of `panorama.js` on the same page (an old theme loader beside a new
+  one) does nothing.
 - **The menu's footer toggle is gone.** It controlled nothing and had no
   label for screen readers. Format icons are hidden from screen readers so
   each card reads as its name, and unavailable cards stay legible.
