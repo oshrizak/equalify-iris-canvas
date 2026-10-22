@@ -5,8 +5,7 @@ The connector launches inside Canvas, watches courses for new PDFs, sends
 them to Iris for conversion into accessible HTML, and publishes the result
 back into Canvas as Pages — with a faculty review workflow, a dial-badge
 overlay over Canvas's own file UI, and a full alt-format catalogue
-(accessible HTML, tagged PDF, ePub, Braille, audio, translation, plain text,
-Markdown).
+(accessible HTML, tagged PDF, ePub, Braille, audio, translation).
 
 Its siblings bring Iris to websites:
 [Equalify Iris for WordPress](https://github.com/EqualifyEverything/equalify-iris-wp)
@@ -40,9 +39,9 @@ endpoints the connector consumes.
 - **Faculty** — upload a PDF, get an accessible Canvas Page in minutes,
   review before students see it, fix anything with an in-browser editor,
   decide what counts as a waivable accessibility finding.
-- **Students** — open the row's dial, get the accessible version in the
-  format that works for them (HTML, Braille, audio, translated to their
-  L1, etc.).
+- **Students** — open the dial beside a published document, get the
+  accessible version in the format that works for them (HTML, tagged PDF,
+  ePub, Braille; audio and translation once their services are set up).
 - **Operators / Canvas admins** — runbook-driven deployment, see
   [`OPERATIONS.md`](OPERATIONS.md).
 
@@ -50,16 +49,26 @@ endpoints the connector consumes.
 
 ### Faculty surfaces
 
-- **Accessibility dial on every PDF row** in Canvas Files, with two
-  honest numbers: PDF/UA-1 score (veraPDF) on the original PDF, and a
-  WCAG structural-check score on the generated HTML. These measure
-  different things and the UI labels them as such — there is no
-  before/after framing.
+- **A dial beside every converted file** in Canvas Files, Modules and
+  links in Pages. It speaks for the accessible version, the thing students
+  get: a check when it is published and passes the automated checks, its
+  score when something needs fixing, "!" for a draft to review or a
+  conversion that needs attention. Students see a dial only once a document
+  is published.
 - **Pending-scan marker** on rows the watcher hasn't picked up yet, so
   faculty isn't left wondering whether processing started.
-- **In-modal alt-format menu** grouped by purpose: Read, Listen &
-  translate, Document formats. 10 generated formats; the original
-  source PDF stays in Canvas Files where faculty uploaded it.
+- **The Alternative Formats Menu** says where the document stands
+  (Publish, Reject, Unpublish), what the two checks found, in words, and
+  what students can open:
+  - *Accessible version*: the automated checks on the HTML students get,
+    as things to fix, improve or confirm by eye.
+  - *Original file*: veraPDF's PDF/UA-1 audit, as whether the PDF is
+    tagged at all and what is wrong with how much of it ("70 pieces of
+    content aren't tagged"), with every rule veraPDF cites a click away.
+    No percentage: as a share of rules passed, an untagged PDF scored 93%.
+  - *Formats for students*: read online (Accessible HTML, Immersive
+    Reader) and download (Searchable PDF, ePub, Braille). Formats whose
+    service isn't set up are named as under development.
 - **Per-document review screen** (`/canvas/review/{job}`) — side-by-side
   live PDF preview + accessible HTML (or live Canvas Page once
   published). Approve, reject, pull-back-to-draft, unpublish.
@@ -111,7 +120,8 @@ endpoints the connector consumes.
   Honors Iris's rate limits (429 / `Retry-After`), retries uploads a
   bounded number of times, and re-sends parts Iris lost.
 - **veraPDF integration** — every source PDF audited against PDF/UA-1
-  on submission; failed rules surfaced inline in the alt-format modal.
+  on submission; the menu reports it in plain words
+  (`connector/canvas/accessibility_summary.py`).
 - **Cost tracking** — the spend cap reserves per page (Iris prices by the
   page); at completion Iris's token counts are recorded per job, and
   turned into a cost when per-token prices are configured.

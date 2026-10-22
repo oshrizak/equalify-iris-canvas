@@ -46,6 +46,10 @@ class Score:
     severity: Severity | None
     available_formats: list[str] = field(default_factory=list)
     status: Literal["scored", "unscanned"] = "scored"
+    # What the automated checks found, grouped and in plain words
+    # (``accessibility_summary.accessible_version_summary``). None when
+    # nothing was checked.
+    checks: dict[str, Any] | None = None
 
 
 @dataclass

@@ -13,12 +13,15 @@ each format must do:
   * Audio and Translate: "under development" until Amazon Polly or an
     Anthropic key is set up, in the menu payload and at their URLs.
   * Approving makes the tagged PDF in the background.
+  * The menu's payload names the file and says, in words, what the checks
+    found on the accessible version and on the original.
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import json
 import re
 import time
 import zipfile
@@ -26,6 +29,7 @@ import zipfile
 import httpx
 import pytest
 import respx
+from connector.api.canvas_panorama import SCORE_CACHE_KEY
 from connector.canvas.state import put_edited_html, put_iris_body, put_job
 
 from tests.integration.iris_fakes import IRIS, _job, _pdf, _run
@@ -40,7 +44,7 @@ BODY = (
 )
 
 
-def _plant(redis_client, course_id, *, edited=False, name="Week 3 reading.pdf", status="published"):
+def _plant(redis_client, course_id, *, edited=False, name="Week 3 reading.pdf", status="published", audit=None):
     async def go():
         await put_job(redis_client, _job(
             canvas_course_id=course_id, status=status, completed_at=time.time(),
@@ -48,6 +52,8 @@ def _plant(redis_client, course_id, *, edited=False, name="Week 3 reading.pdf", 
             iris_parts=[{"index": 0, "first_page": 1, "last_page": 2, "session_id": "ses_z",
                          "status": "ready_for_review", "error": None}],
             iris_figures=[],
+            **({"verapdf_score": 93, "verapdf_is_compliant": False, "verapdf_violations": audit}
+               if audit is not None else {}),
         ))
         await put_iris_body(redis_client, "job-iris-1", BODY)
         if edited:
@@ -259,3 +265,69 @@ def test_accessible_html_loads_mathjax_only_for_latex(client, instructor_session
     _run(body("<h1>T</h1><p>Area $$\\pi r^2$$</p>"))
     latex = client.get("/canvas/panorama/alt/job-iris-1/html").text
     assert "mathjax" in latex.lower()
+
+
+# ---- What the menu says about the two checks --------------------------------
+
+# veraPDF on a PDF with no tags: few rules fail, each of them many times, so
+# the share of rules passed (93) flattered it.
+UNTAGGED_AUDIT = [
+    {"rule_id": "7.1-11", "clause": "7.1", "occurrence_count": 1,
+     "description": "The logical structure shall be described by a structure hierarchy"},
+    {"rule_id": "7.1-3", "clause": "7.1", "occurrence_count": 70,
+     "description": "Content shall be marked as Artifact or tagged as real content"},
+]
+
+
+def _menu_payload(client):
+    return client.get("/canvas/panorama/score_by_job?job_ids=job-iris-1").json()["scores"]["job-iris-1"]
+
+
+@pytest.mark.integration
+def test_the_menu_names_the_file_and_says_what_each_check_found(client, instructor_session, redis_client):
+    _plant(redis_client, instructor_session["course_id"], audit=UNTAGGED_AUDIT)
+    payload = _menu_payload(client)
+    assert payload["file_name"] == "Week 3 reading.pdf"
+    original = payload["original"]
+    assert (original["verdict"], original["headline"]) == ("untagged", "Not tagged")
+    assert [p["label"] for p in original["problems"]] == [
+        "The PDF has no tags, so screen readers get no headings, lists or reading order",
+        "70 pieces of content aren’t tagged",
+    ]
+    assert payload["status"] == "scored"
+    assert set(payload["checks"]) == {"errors", "warnings", "confirm", "items"}
+    # The number stays for API callers; the menu no longer shows it.
+    assert payload["source_score"] == 93
+
+
+@pytest.mark.integration
+def test_a_file_without_an_audit_has_no_original_summary(client, instructor_session, redis_client):
+    _plant(redis_client, instructor_session["course_id"], name="Lab safety.docx")
+    payload = _menu_payload(client)
+    assert payload["file_name"] == "Lab safety.docx"
+    assert "original" not in payload
+
+
+@pytest.mark.integration
+def test_every_surface_says_when_faculty_edited_it(client, instructor_session, redis_client):
+    course = instructor_session["course_id"]
+    _plant(redis_client, course)
+    assert _menu_payload(client)["edited"] is False
+    _plant(redis_client, course, edited=True)
+    by_file = client.get(f"/canvas/panorama/score?course_id={course}&file_ids=f1").json()["scores"]["f1"]
+    by_name = client.get(f"/canvas/panorama/scored_files?course_id={course}").json()["by_filename"]
+    assert by_file["edited"] is True
+    assert by_name["Week 3 reading.pdf"]["edited"] is True
+    assert _menu_payload(client)["edited"] is True
+
+
+@pytest.mark.integration
+def test_a_score_cached_before_the_checks_were_listed_is_worked_out_again(
+    client, instructor_session, redis_client,
+):
+    _plant(redis_client, instructor_session["course_id"])
+    stale = {"status": "scored", "score": 41, "severity": "amber", "available_formats": ["html"]}
+    _run(redis_client.set(SCORE_CACHE_KEY.format(job_id="job-iris-1"), json.dumps(stale)))
+    payload = _menu_payload(client)
+    assert "checks" in payload
+    assert payload["score"] != 41

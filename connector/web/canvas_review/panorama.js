@@ -72,9 +72,9 @@
   // and Markdown served no student. Their URLs still answer, for links
   // people saved.
   var FORMAT_GROUPS = [
-    { id: "read",      label: "Read"             },
-    { id: "listen",    label: "Listen & translate" },
-    { id: "document",  label: "Document formats" }
+    { id: "read",      label: "Read online" },
+    { id: "document",  label: "Download" },
+    { id: "listen",    label: "Listen and translate" }
   ];
   var FORMATS = [
     { id: "html",      group: "read",     label: "Accessible HTML",    icon: "🌐", color: "#0a5fb5", live: true },
@@ -472,145 +472,110 @@
     return "red";
   }
 
-  // Map a payload to what the row dial should show. The dial decorates the
-  // ORIGINAL PDF in Canvas, so once a file has finished converting it shows
-  // the *source* accessibility estimate (the "before") — that's the number
-  // faculty want next to the original file. The accessible version's WCAG
-  // score (the "after") lives in the modal's report header. Pre-publish and
-  // failure states still take priority and render an action badge so the
-  // call-to-action is never masked by a number.
+  // Does the accessible version have something an instructor should fix
+  // or improve: an error or a warning on the automated checks? Items to
+  // confirm by eye (an image marked decorative) don't count; the menu
+  // lists them.
+  function _needsWork(payload) {
+    if (!payload || payload.status !== "scored" || typeof payload.score !== "number") return false;
+    var c = payload.checks;
+    return c ? !!(c.errors || c.warnings) : payload.score < 100;
+  }
+
+  var _CHECK_VIEW = { score: 100, label: "✓", color: COLORS.green, severity: "green" };
+
+  function _scoreView(payload, note) {
+    var sc = payload.score;
+    var sev = payload.severity || severityFor(sc);
+    return { score: sc, label: sc + "%", color: COLORS[sev] || COLORS.red, severity: sev,
+             title: "Accessible version: " + sc + " out of 100 on the automated checks." + (note || "") + " Open the formats menu.",
+             aria: "Accessible version scores " + sc + " out of 100 on the automated checks." + (note || "")
+                   + " Open the alternative formats menu." };
+  }
+
+  // What the dial beside a file shows. It speaks for the accessible
+  // version, the thing students get, never for the original file: the
+  // original's PDF/UA result is in the menu, in words. (As a share of
+  // PDF/UA rules passed it read 93% for a PDF with no tags at all, and a
+  // number beside the original file's link reads as that file's score.)
+  //
+  // Students get a dial only once the document is published (see
+  // shouldDecorate), and it says one thing: there is an accessible version.
+  // Instructors get what needs doing: review a draft, wait for a
+  // conversion, look at a failure, or fix the accessible version (its
+  // score, shown only when something needs fixing). A check means
+  // published and passing.
   function dialView(payload) {
     var js = String(payload.job_status || "").toLowerCase();
+    if (STATE.userRole !== "Instructor") {
+      return Object.assign({}, _CHECK_VIEW, {
+        title: "Accessible version available. Open the formats menu.",
+        aria: "Accessible version available. Open the alternative formats menu." });
+    }
     if (js === "awaiting_approval") {
       return { score: 0, label: "!", color: COLORS.amber, severity: "amber",
-               title: "Privacy review needed — click to approve or deny",
-               aria: "A privacy review is needed before this document can finish converting. Click to approve or deny." };
+               title: "Privacy review needed. Open the menu to approve or deny.",
+               aria: "A privacy review is needed before this document can finish converting. Open the menu to approve or deny." };
     }
     if (js === "awaiting_review") {
       return { score: 0, label: "!", color: COLORS.amber, severity: "amber",
-               title: "Needs your review — click to approve",
-               aria: "Needs your review. Click to approve so students can see accessible formats." };
+               title: "Draft: review it and publish it for students.",
+               aria: "Draft accessible version. Open the menu to review and publish it for students." };
     }
     if (js === "processing" || js === "pii_scanning" || js === "processing_queued") {
       return { score: 0, label: "…", color: COLORS.unscanned, severity: "unscanned",
-               title: "Converting… check back shortly",
-               aria: "Converting. Check back shortly." };
+               title: "Converting. Check back in a few minutes.",
+               aria: "Converting. Check back in a few minutes." };
     }
-    // page_failed: conversion succeeded but Canvas rejected the page write
-    // (usually a missing Pages permission on the connected account). The
-    // accessibility result IS available — we fall through to the score
-    // display below so the dial reflects the real "before/after" numbers,
-    // and the completed-path logic augments the tooltip with the
-    // page-failure note so the action is still discoverable.
     if (js === "failed" || js === "denied" || js === "rejected") {
       return { score: 0, label: "!", color: COLORS.red, severity: "red",
-               title: "Conversion needs attention — click for details",
-               aria: "Conversion needs attention. Click for details." };
+               title: "Conversion needs attention. Open the menu for details.",
+               aria: "Conversion needs attention. Open the menu for details." };
     }
-    // Completed.
-    var hasSource = typeof payload.source_score === "number";
-    var hasOutput = payload.status === "scored" && typeof payload.score === "number";
-    // Students never see the raw score (it isn't student-actionable, and a
-    // low "before" estimate on the original PDF would be alarming). Once an
-    // accessible version exists, give them a positive confirmation instead.
-    if (STATE.userRole !== "Instructor") {
-      if (hasSource || hasOutput || js === "published") {
-        return { score: 0, label: "✓", color: COLORS.green, severity: "green",
-                 title: "Accessible version available — open formats",
-                 aria: "Accessible version available. Open Alternative Formats Menu." };
-      }
+    if (js === "page_failed") {
+      // The conversion finished but Canvas refused the page (usually a
+      // missing Pages permission on the connected account): an action.
+      return { score: 0, label: "!", color: COLORS.amber, severity: "amber",
+               title: "The Canvas page couldn’t be created. Open the menu for details.",
+               aria: "The Canvas page couldn't be created. Open the menu for details." };
     }
-    // page_failed addendum used by both score branches below — actionable
-    // note about the Canvas Page write without burying the actual score.
-    var pageFailedNote = (js === "page_failed")
-      ? " (Canvas Page not created — click for details)"
-      : "";
-    // Instructors: show two independent measurements. These are NOT a
-    // before/after of the same thing — the source_score is veraPDF's
-    // PDF/UA-1 validation of the original PDF (1000+ rules, fractional),
-    // while score is our WCAG structural checks on the generated HTML
-    // (a focused subset, penalty-based). Faculty asked us to stop
-    // implying improvement when the two simply measure different things.
-    if (hasSource) {
-      var ss = payload.source_score;
-      var ssev = payload.source_severity || severityFor(ss);
-      var after = hasOutput
-        ? (" · Generated HTML (WCAG): " + payload.score + "%")
-        : "";
-      return { score: ss, label: ss + "%", color: COLORS[ssev] || COLORS.red,
-               severity: ssev,
-               title: "Original PDF (PDF/UA): " + ss + "%" + after + pageFailedNote
-                      + " — different measurements, not a before/after. Click to open."
-                      ,
-               aria: "Original PDF scores " + ss
-                     + " percent on PDF slash UA dash 1 by veraPDF"
-                     + (hasOutput ? ("; generated HTML scores " + payload.score
-                                    + " percent on a WCAG structural check subset. "
-                                    + "These measure different documents and are not directly comparable")
-                                  : "")
-                     + (js === "page_failed" ? "; Canvas Page could not be created" : "")
-                     + ". Open Alternative Formats Menu." };
-    }
-    // No source estimate (older job without signals): fall back to the
-    // output score, then to a generic "available" / "open" affordance.
-    if (hasOutput) {
-      var sc = payload.score;
-      var sev = payload.severity || severityFor(sc);
-      return { score: sc, label: sc + "%", color: COLORS[sev] || COLORS.red,
-               severity: sev,
-               title: "Accessibility " + sc + "%" + pageFailedNote + " — open Alternative Formats Menu",
-               aria: "Accessibility " + sc + "%"
-                     + (js === "page_failed" ? "; Canvas Page could not be created" : "")
-                     + ". Open Alternative Formats Menu." };
-    }
+    if (_needsWork(payload)) return _scoreView(payload);
     if (js === "published") {
-      return { score: 0, label: "✓", color: COLORS.green, severity: "green",
-               title: "Accessible version available",
-               aria: "Accessible version available. Open Alternative Formats Menu." };
+      var passes = payload.status === "scored" && typeof payload.score === "number";
+      return Object.assign({}, _CHECK_VIEW, {
+        title: passes ? "Published. The accessible version passes the automated checks." : "Published. Open the formats menu.",
+        aria: (passes ? "Published. The accessible version passes the automated checks." : "Published.")
+              + " Open the alternative formats menu." });
     }
     return { score: 0, label: "—", color: COLORS.unscanned, severity: "unscanned",
-             title: "Open Alternative Formats Menu",
-             aria: "Open Alternative Formats Menu." };
+             title: "Open the formats menu.",
+             aria: "Open the alternative formats menu." };
   }
 
-  // Dial for the ACCESSIBLE-VERSION link (the tool endpoint). This is the
-  // generated output, so it shows the WCAG accessibility score — the "after"
-  // — rather than the original PDF's source estimate. Never shows the source
-  // estimate, and reads positively for both faculty and students.
+  // The dial on the accessible version's own link, inside the published
+  // Canvas page. Same rule: a check, or for instructors the score when the
+  // accessible version needs fixing.
   function accessibleDialView(payload) {
-    var hasOutput = payload && payload.status === "scored" && typeof payload.score === "number";
-    if (hasOutput) {
-      var sc = payload.score;
-      var sev = payload.severity || severityFor(sc);
-      return { score: sc, label: sc + "%", color: COLORS[sev] || COLORS.green,
-               severity: sev,
-               title: "Accessible version — WCAG accessibility " + sc + "% (open Alternative Formats Menu)",
-               aria: "Accessible version. WCAG accessibility " + sc + " percent. Open Alternative Formats Menu." };
-    }
     var js = String((payload && payload.job_status) || "").toLowerCase();
     if (js === "processing" || js === "pii_scanning" || js === "processing_queued") {
       return { score: 0, label: "…", color: COLORS.unscanned, severity: "unscanned",
-               title: "Converting… check back shortly",
-               aria: "Converting. Check back shortly." };
+               title: "Converting. Check back in a few minutes.",
+               aria: "Converting. Check back in a few minutes." };
     }
-    if (js === "published" || js === "awaiting_review") {
-      return { score: 0, label: "✓", color: COLORS.green, severity: "green",
-               title: "Accessible version available",
-               aria: "Accessible version available. Open Alternative Formats Menu." };
-    }
-    return { score: 0, label: "✓", color: COLORS.green, severity: "green",
-             title: "Accessible version",
-             aria: "Accessible version. Open Alternative Formats Menu." };
+    if (STATE.userRole === "Instructor" && _needsWork(payload)) return _scoreView(payload);
+    return Object.assign({}, _CHECK_VIEW, {
+      title: "Accessible version. Open the formats menu.",
+      aria: "Accessible version. Open the alternative formats menu." });
   }
 
-  // Should we attach a dial for this file? Instructors see every state
-  // (so they can act on drafts/failures); students only see files that
-  // have something usable for them (a score or a published version).
+  // Should this file get a dial? Only files Iris has converted or is
+  // converting: a link to anything else (an image, a file nobody sent to
+  // Iris) would open an empty menu. Students only once it is published,
+  // because that is when they can open the formats.
   function shouldDecorate(payload) {
-    if (!payload) return false;
+    if (!payload || !payload.job_id) return false;
     if (STATE.userRole === "Instructor") return true;
-    var js = String(payload.job_status || "").toLowerCase();
-    return payload.status === "scored" || js === "published";
+    return String(payload.job_status || "").toLowerCase() === "published";
   }
 
   // Typography helper shared between the row dial and the big modal dial.
@@ -644,13 +609,43 @@
   }
 
   function makeDial(payload, filename, opts) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn._iris = { payload: payload, filename: filename, opts: opts };
+    _paintDial(btn);
+    btn.addEventListener("click", function (e) {
+      e.preventDefault(); e.stopPropagation();
+      openFormatsModal(payload, filename);
+    });
+    return btn;
+  }
+
+  // After Publish, Reject or Unpublish, every dial for that document says
+  // its new state without a reload, and opens a menu that matches. Dials
+  // are repainted in place, so the one that opened the menu still takes
+  // focus back when it closes.
+  var _STATUS_AFTER = { approve: "published", reject: "rejected", unpublish: "awaiting_review", request_edits: "awaiting_review" };
+
+  function _restatusDials(jobId, action) {
+    var status = _STATUS_AFTER[action];
+    if (!jobId || !status) return;
+    var dials = document.querySelectorAll(".reflow-pn-dial");
+    for (var i = 0; i < dials.length; i++) {
+      var bound = dials[i]._iris;
+      if (!bound || bound.payload.job_id !== jobId) continue;
+      bound.payload.job_status = status;
+      _paintDial(dials[i]);
+    }
+  }
+
+  function _paintDial(btn) {
+    var bound = btn._iris;
+    var payload = bound.payload, opts = bound.opts;
     var v = (opts && opts.accessible) ? accessibleDialView(payload) : dialView(payload);
     var score = v.score;
     var severity = v.severity;
     var color = v.color;
     var label = v.label;
-    var btn = document.createElement("button");
-    btn.type = "button";
     btn.className = "reflow-pn-dial reflow-pn-sev-" + severity;
     btn.title = v.title;
     btn.setAttribute("aria-label", v.aria);
@@ -662,16 +657,13 @@
     btn.innerHTML =
       '<svg viewBox="0 0 36 36" width="36" height="36" aria-hidden="true">' +
       '  <circle cx="18" cy="18" r="15.9155" fill="none" stroke="#eef0f3" stroke-width="2.6"/>' +
-      '  <circle cx="18" cy="18" r="15.9155" fill="none" stroke="' + color + '" stroke-width="2.6"' +
-      '          stroke-dasharray="' + score + ' ' + (100 - score) + '" stroke-dashoffset="25"' +
-      '          stroke-linecap="round" transform="rotate(-90 18 18)"/>' +
+      (score > 0
+        ? '  <circle cx="18" cy="18" r="15.9155" fill="none" stroke="' + color + '" stroke-width="2.6"' +
+          '          stroke-dasharray="' + score + ' ' + (100 - score) + '" stroke-dashoffset="25"' +
+          '          stroke-linecap="' + (score >= 100 ? 'butt' : 'round') + '" transform="rotate(-90 18 18)"/>'
+        : '') +
       _dialTextSvg(label, color, { num: 14, pct: 7, single: 16 }) +
       '</svg>';
-    btn.addEventListener("click", function (e) {
-      e.preventDefault(); e.stopPropagation();
-      openFormatsModal(payload, filename);
-    });
-    return btn;
   }
 
   function makeWidgetWrap(payload, filename) {
@@ -716,6 +708,9 @@
       var fallback = stem + "." + (DOWNLOAD_EXT[fmt.id] || "bin");
       el.setAttribute("aria-busy", "true");
       el.classList.add("is-busy");
+      var typeEl = el.querySelector(".reflow-pn-format-type");
+      var typeText = typeEl ? typeEl.textContent : "";
+      if (typeEl) typeEl.textContent = "Preparing\u2026";
       _say(statusEl, "Preparing " + fmt.label + "\u2026");
       // With credentials: an instructor's draft preview needs the LTI
       // cookie. A published document needs none and works either way.
@@ -765,49 +760,86 @@
         .then(function () {
           el.removeAttribute("aria-busy");
           el.classList.remove("is-busy");
+          if (typeEl) typeEl.textContent = typeText;
         });
     });
+  }
+
+  // ---- The Alternative Formats Menu ------------------------------------
+  //
+  // One dialog, two audiences. Students get the accessible version first
+  // and the other formats under it. Instructors also get where the
+  // document stands, with the publish actions, and the two accessibility
+  // checks in words: the accessible version (what students get) beside
+  // the original file (what was uploaded).
+
+  var FORMAT_TEXT = {
+    html:      { desc: "A web page that works with screen readers, zoom and text-to-speech.", type: "Opens in a new tab", kind: "page" },
+    immersive: { desc: "Reads aloud, with larger text, a dark theme and a reading line.", type: "Opens in a new tab", kind: "page" },
+    ocr:       { desc: "The original pages, tagged for screen readers and search.", type: "PDF", kind: "file" },
+    epub:      { desc: "An e-book for apps such as Apple Books and Thorium Reader.", type: "EPUB", kind: "file" },
+    braille:   { desc: "Contracted braille for embossers and braille displays.", type: "BRF", kind: "file" },
+    audio:     { desc: "Listen to the document.", type: "MP3", kind: "file" },
+    translate: { desc: "Read it in another language.", type: "Opens in a new tab", kind: "page" }
+  };
+
+  function _isInstructor() { return STATE.userRole === "Instructor"; }
+
+  function _previewSuffix(payload) {
+    return (payload.job_status !== "published" && _isInstructor()) ? "?preview=1" : "";
+  }
+
+  function _altHref(payload, fmtId) {
+    return ORIGIN + "/canvas/panorama/alt/" + encodeURIComponent(payload.job_id || "") + "/" + fmtId + _previewSuffix(payload);
+  }
+
+  // The accessible Canvas page, unless this IS that page.
+  function _canvasPageLink(payload) {
+    var href = _canvasPageHref(payload);
+    if (!href) return "";
+    try {
+      if (new URL(href, location.href).pathname.replace(/\/$/, "") === location.pathname.replace(/\/$/, "")) return "";
+    } catch (e) { /* show the link */ }
+    return href;
   }
 
   function openFormatsModal(payload, filename) {
     var existing = document.getElementById("reflow-pn-modal");
     if (existing) existing.remove();
-    var score = payload.status === "scored" ? (payload.score || 0) : null;
-    var severity = payload.severity || "unscanned";
-    var color = COLORS[severity] || COLORS.unscanned;
+    // The dial on a link inside a page passes the link's words ("Original
+    // PDF"); the job knows the file's real name.
+    var name = payload.file_name || filename || "Document";
+    var instructor = _isInstructor();
 
     var overlay = document.createElement("div");
     overlay.id = "reflow-pn-modal";
     overlay.className = "reflow-pn-modal";
-    overlay.setAttribute("role", "dialog");
-    overlay.setAttribute("aria-modal", "true");
 
     var modal = document.createElement("div");
     modal.className = "reflow-pn-modal-card";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "reflow-pn-modal-title");
     modal.innerHTML =
-      '<header class="reflow-pn-modal-header">' +
+      '<div class="reflow-pn-modal-header">' +
       '  <div class="reflow-pn-modal-titles">' +
-      '    <h2>Alternative Formats Menu</h2>' +
-      '    <p>' + esc(filename || "Document") + (payload.edited ? ' <span class="reflow-pn-edited">edited</span>' : '') + '</p>' +
+      '    <h2 id="reflow-pn-modal-title">' + esc(name) + '</h2>' +
+      '    <p>Alternative formats' + (payload.edited && instructor ? ' <span class="reflow-pn-edited">Edited by faculty</span>' : '') + '</p>' +
       '  </div>' +
-      '  <button class="reflow-pn-modal-close" type="button" aria-label="Close">&times;</button>' +
-      '</header>' +
-      _renderReportHeader(payload, score, color) +
-      _renderVerapdfViolations(payload) +
-      _renderCanvasPageBanner(payload) +
-      _renderApprovalBar(payload) +
-      (STATE.userRole === "Instructor"
-        ? '<section class="reflow-pn-modal-tools">' +
-          (payload.job_id ? '  <button class="reflow-pn-edit-btn" type="button">✏️ Edit Accessible HTML</button>' : '') +
-          '  <span class="reflow-pn-tools-hint">Fix tables, math, chemistry — edits become the source for all formats below. Use Save then Publish in the editor when it is ready for students.</span>' +
-          '</section>'
-        : '') +
-      _renderFormatBody(payload) +
-      _renderAuthBanner() +
-      _renderConsentBanner() +
-      '<footer class="reflow-pn-modal-footer">' +
-      _renderConsentFooter() +
-      '</footer>';
+      '  <button class="reflow-pn-modal-close" type="button" aria-label="Close">' +
+      '    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false"><path d="M3.5 3.5l9 9m0-9l-9 9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>' +
+      '  </button>' +
+      '</div>' +
+      '<div class="reflow-pn-modal-body">' +
+        (instructor ? _renderAuthBanner() + _renderConsentBanner() : '') +
+        (instructor ? _renderApprovalBar(payload) : '') +
+        (instructor ? _renderChecks(payload) : _renderStudentPrimary(payload)) +
+        '<section class="reflow-pn-formats" aria-labelledby="reflow-pn-formats-title">' +
+        '  <h3 id="reflow-pn-formats-title" class="reflow-pn-section-title">' + (instructor ? 'Formats for students' : 'Other formats') + '</h3>' +
+        '  <div class="reflow-pn-modal-grid"></div>' +
+        '</section>' +
+      '</div>' +
+      (instructor ? '<div class="reflow-pn-modal-footer">' + _renderConsentFooter() + '</div>' : '');
 
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
@@ -820,111 +852,15 @@
     var previouslyFocused = document.activeElement;
     _wcagify_modal(overlay, modal, previouslyFocused);
 
-    // Insert the report dial SVG (instructor-only — students don't get
-    // a score readout because the score is faculty-actionable, not
-    // student-actionable).
-    var dialContainer = modal.querySelector(".reflow-pn-report-dial");
-    if (dialContainer) {
-      // Same look as the row dial, sized up. Sizes tuned so the modal's
-      // 52×52 render gives the digits room to breathe at high DPI.
-      var mLabel = (score === null) ? "—" : (score + "%");
-      dialContainer.innerHTML =
-        '<svg viewBox="0 0 36 36" width="52" height="52" aria-hidden="true">' +
-        '  <circle cx="18" cy="18" r="15.9155" fill="none" stroke="#eef0f3" stroke-width="2.6"/>' +
-        '  <circle cx="18" cy="18" r="15.9155" fill="none" stroke="' + color + '" stroke-width="2.6"' +
-        '          stroke-dasharray="' + (score || 0) + ' ' + (100 - (score || 0)) + '" stroke-dashoffset="25"' +
-        '          stroke-linecap="round" transform="rotate(-90 18 18)"/>' +
-        _dialTextSvg(mLabel, color, { num: 11, pct: 6, single: 13 }) +
-        '</svg>';
-    }
-
-    // Student smart-default primary CTA: wire up the "Open accessible
-    // version" button to the Accessible HTML route for this job.
-    // Faculty-side modal doesn't render this element.
-    var studentPrimary = modal.querySelector(".reflow-pn-student-primary");
-    if (studentPrimary && payload.job_id) {
-      var previewSuffix = (payload.job_status !== "published" && STATE.userRole === "Instructor") ? "?preview=1" : "";
-      studentPrimary.href = ORIGIN + "/canvas/panorama/alt/" + encodeURIComponent(payload.job_id) + "/html" + previewSuffix;
-    }
-
-    // Populate formats grid — grouped by FORMAT_GROUPS so faculty can
-    // scan by purpose ("read" vs "listen & translate" vs "document
-    // formats" vs "original") instead of staring at a wall of 11
-    // identical-looking squares.
-    var grid = modal.querySelector(".reflow-pn-modal-grid");
-    var availableLive = payload.available_formats || ["html", "txt", "markdown"];
-    // Formats this server cannot serve yet (audio needs Amazon Polly,
-    // translation an Anthropic key) come back as under development.
-    var underDevelopment = payload.under_development || [];
-    // One polite status line for every download in the menu: what is being
-    // prepared, what arrived, and why something could not be made.
-    var fmtStatus = document.createElement("p");
-    fmtStatus.className = "reflow-pn-fmt-status";
-    fmtStatus.setAttribute("role", "status");
-    fmtStatus.setAttribute("aria-live", "polite");
-    function _buildFmtCard(fmt) {
-      var held = underDevelopment.indexOf(fmt.id) >= 0;
-      var enabled = fmt.live && !held && (availableLive.indexOf(fmt.id) >= 0
-                                  || fmt.id === "immersive"
-                                  || fmt.id === "braille"
-                                  || fmt.id === "ocr");
-      var el = document.createElement(enabled ? "a" : "div");
-      el.className = "reflow-pn-fmt-card" + (enabled ? "" : " is-disabled");
-      if (enabled) {
-        if (fmt.picker === "language") {
-          el.href = "#";
-          el.addEventListener("click", function (e) {
-            e.preventDefault();
-            openLanguagePicker(payload);
-          });
-        } else {
-          // If the job hasn't been approved yet, instructors can still preview.
-          // Append ?preview=1 so the backend bypasses the published-only gate.
-          var previewSuffix = (payload.job_status !== "published" && STATE.userRole === "Instructor") ? "?preview=1" : "";
-          el.href = ORIGIN + "/canvas/panorama/alt/" + encodeURIComponent(payload.job_id || "") + "/" + fmt.id + previewSuffix;
-          if (fmt.download) {
-            // No ``target="_blank"`` here — that would briefly open an
-            // empty tab while the connector renders, which is what
-            // faculty noticed and asked to fix.
-            _wireDownload(el, el.href, fmt, filename, fmtStatus);
-          } else {
-            el.target = "_blank"; el.rel = "noopener";
-          }
-        }
-      } else {
-        el.setAttribute("aria-disabled", "true");
-        el.title = held ? "Under development" : "Not available for this document";
-      }
-      el.innerHTML =
-        '<span class="reflow-pn-fmt-card-icon" aria-hidden="true" style="background:' + fmt.color + '14;color:' + fmt.color + '">' +
-        fmt.icon + '</span>' +
-        '<span class="reflow-pn-fmt-card-label">' + esc(fmt.label) + '</span>' +
-        (enabled ? "" : '<span class="reflow-pn-fmt-card-soon">' +
-          (held ? "Under development" : "Unavailable") + '</span>');
-      return el;
-    }
-    FORMAT_GROUPS.forEach(function (group) {
-      var fmtsInGroup = FORMATS.filter(function (f) { return f.group === group.id; });
-      if (!fmtsInGroup.length) return;
-      var section = document.createElement("section");
-      section.className = "reflow-pn-fmt-group";
-      section.innerHTML =
-        '<h3 class="reflow-pn-fmt-group-label">' + esc(group.label) + '</h3>' +
-        '<div class="reflow-pn-fmt-group-grid"></div>';
-      var groupGrid = section.querySelector(".reflow-pn-fmt-group-grid");
-      fmtsInGroup.forEach(function (fmt) {
-        groupGrid.appendChild(_buildFmtCard(fmt));
-      });
-      grid.appendChild(section);
-    });
-    grid.appendChild(fmtStatus);
+    _buildFormats(modal.querySelector(".reflow-pn-modal-grid"), payload, name);
 
     function close() { overlay.remove(); }
     overlay.addEventListener("click", function (e) { if (e.target === overlay) close(); });
     modal.querySelector(".reflow-pn-modal-close").addEventListener("click", close);
 
-    // "Authorize Reflow" button (instructors who haven't OAuth'd). Opens the
-    // consent popup; the message listener refreshes status on success.
+    // "Authorize Iris" (instructors who haven't connected their Canvas
+    // account). Opens the consent popup; the message listener refreshes
+    // status on success.
     var authBtn = modal.querySelector(".reflow-pn-auth-btn");
     if (authBtn) {
       authBtn.addEventListener("click", function (e) {
@@ -934,48 +870,236 @@
       });
     }
 
-    // Re-check AI-API consent on open so the "Authorization required…"
-    // banner disappears for instructors who already accepted — including the
-    // case where they just accepted in the consent tab (opened via the
-    // button) without reloading the page. Also flips the footer to the
-    // "✓ Authorized" line.
-    loadConsentStatus().then(function (c) {
-      if (!c || !c.agreed) return;
-      var cb = modal.querySelector("#reflow-pn-consent-banner");
-      if (cb) cb.remove();
-      var ft = modal.querySelector(".reflow-pn-modal-footer .reflow-pn-footer-text");
-      if (ft) {
-        var when = fmtConsentDate(c.agreed_at);
-        ft.innerHTML = '<span class="reflow-pn-consent-ok" aria-hidden="true">✓</span> ' +
-          'Authorized' + (when ? ' on ' + esc(when) : '') +
-          ' · <a href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">View terms</a>';
-      }
-    }).catch(function () {});
-
-    // Approve / Reject / Request-edits — re-render the modal after a transition
-    // so the badge color and the button set reflect the new state.
-    _wireApprovalActions(modal, payload, function () { close(); openFormatsModal(payload, filename); });
-
-    var editBtn = modal.querySelector(".reflow-pn-edit-btn:not(.reflow-pn-convert-btn)");
-    if (editBtn) {
-      editBtn.addEventListener("click", function () {
-        openHtmlEditor(payload, filename);
-      });
+    // Re-check consent on open so the "Authorize Iris" notice disappears for
+    // instructors who already accepted, including in another tab, and the
+    // footer says when.
+    if (instructor) {
+      loadConsentStatus().then(function (c) {
+        if (!c || !c.agreed) return;
+        var cb = modal.querySelector("#reflow-pn-consent-banner");
+        if (cb) cb.remove();
+        var ft = modal.querySelector(".reflow-pn-modal-footer .reflow-pn-footer-text");
+        if (ft) ft.innerHTML = _consentAgreedText(c);
+      }).catch(function () {});
     }
 
-    // The "refresh accessible page" action now lives in the Edit HTML editor
-    // toolbar (openHtmlEditor, data-act="refresh") instead of a separate
-    // button here — it's a post-edit utility, not a primary modal action.
+    // Publish / Reject / Unpublish, and the privacy decision.
+    _wireApprovalActions(modal, payload, function () { close(); openFormatsModal(payload, filename); });
+
+    var editBtn = modal.querySelector(".reflow-pn-edit-btn");
+    if (editBtn) {
+      editBtn.addEventListener("click", function () {
+        openHtmlEditor(payload, name);
+      });
+    }
 
     document.addEventListener("keydown", function escK(e) {
       if (e.key === "Escape") {
         var m = document.getElementById("reflow-pn-modal");
         var ed = document.getElementById("reflow-pn-editor");
         if (ed) ed.remove();
-        else if (m) m.remove();
+        else if (m) {
+          m.remove();
+          try { if (previouslyFocused && previouslyFocused.focus) previouslyFocused.focus(); } catch (_) { /* gone */ }
+        }
         document.removeEventListener("keydown", escK);
       }
     });
+  }
+
+  // Students: the accessible version is the answer, so it comes first.
+  function _renderStudentPrimary(payload) {
+    if (!payload.job_id) return "";
+    var href = _canvasPageLink(payload) || _altHref(payload, "html");
+    return '<section class="reflow-pn-student-cta">' +
+      '  <a class="reflow-pn-student-primary" href="' + esc(href) + '" target="_blank" rel="noopener">' +
+      '    <span class="reflow-pn-student-primary-text">Open the accessible version</span>' +
+      '    <span class="reflow-pn-student-primary-hint">Opens in a new tab</span>' +
+      '  </a>' +
+      '  <p class="reflow-pn-student-note">Made for screen readers, zoom and text-to-speech. The original file is unchanged.</p>' +
+      '</section>';
+  }
+
+  // The format list: what a student can open or download, grouped by what
+  // they would do with it. Formats this server cannot make yet are named in
+  // one line at the end rather than shown as dead buttons.
+  function _buildFormats(grid, payload, name) {
+    var available = payload.available_formats || ["html"];
+    var held = payload.under_development || [];
+    // A student's first button opens the accessible HTML when there is no
+    // Canvas page to send them to; it needn't be listed again under it.
+    var shown = (!_isInstructor() && !_canvasPageLink(payload)) ? ["html"] : [];
+    var status = document.createElement("p");
+    status.className = "reflow-pn-fmt-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    var heldLabels = [];
+    FORMAT_GROUPS.forEach(function (group) {
+      var rows = [];
+      FORMATS.filter(function (f) { return f.group === group.id; }).forEach(function (fmt) {
+        if (held.indexOf(fmt.id) >= 0) { heldLabels.push(fmt.label.replace(/…$/, "")); return; }
+        if (shown.indexOf(fmt.id) >= 0) return;
+        var live = fmt.live && (available.indexOf(fmt.id) >= 0 || fmt.id === "immersive" || fmt.id === "braille" || fmt.id === "ocr");
+        if (!live || !payload.job_id) return;
+        rows.push(_formatRow(fmt, payload, name, status));
+      });
+      if (!rows.length) return;
+      var section = document.createElement("div");
+      section.className = "reflow-pn-fmt-group";
+      var title = document.createElement("h4");
+      title.className = "reflow-pn-fmt-group-label";
+      title.textContent = group.label;
+      var list = document.createElement("ul");
+      list.className = "reflow-pn-fmt-list";
+      rows.forEach(function (row) {
+        var li = document.createElement("li");
+        li.appendChild(row);
+        list.appendChild(li);
+      });
+      section.appendChild(title);
+      section.appendChild(list);
+      grid.appendChild(section);
+    });
+    if (heldLabels.length) {
+      var note = document.createElement("p");
+      note.className = "reflow-pn-fmt-later";
+      note.textContent = "Under development: " + _joinWords(heldLabels) + ".";
+      grid.appendChild(note);
+    }
+    grid.appendChild(status);
+  }
+
+  function _joinWords(words) {
+    if (words.length < 2) return words.join("");
+    return words.slice(0, -1).join(", ") + " and " + words[words.length - 1];
+  }
+
+  function _formatRow(fmt, payload, name, statusEl) {
+    var text = FORMAT_TEXT[fmt.id] || { desc: "", type: "", kind: "page" };
+    var descId = "reflow-pn-fmt-desc-" + fmt.id;
+    var el = document.createElement("a");
+    el.className = "reflow-pn-format";
+    el.innerHTML =
+      '<span class="reflow-pn-format-name">' + esc(fmt.label) + '</span>' +
+      '<span class="reflow-pn-format-type">' + esc(text.type) + '</span>' +
+      '<span class="reflow-pn-format-desc" id="' + descId + '">' + esc(text.desc) + '</span>';
+    el.setAttribute("aria-describedby", descId);
+    if (fmt.picker === "language") {
+      el.href = "#";
+      el.setAttribute("aria-label", fmt.label.replace(/…$/, "") + ", choose a language");
+      el.addEventListener("click", function (e) {
+        e.preventDefault();
+        openLanguagePicker(payload);
+      });
+      return el;
+    }
+    el.href = _altHref(payload, fmt.id);
+    if (fmt.download) {
+      // "Braille (BRF)" already names its type; "ePub" doesn't.
+      var named = fmt.label.indexOf("(" + text.type + ")") >= 0 ? fmt.label : fmt.label + " (" + text.type + ")";
+      el.setAttribute("aria-label", "Download " + named);
+      _wireDownload(el, el.href, fmt, name, statusEl);
+    } else {
+      el.target = "_blank";
+      el.rel = "noopener";
+      el.setAttribute("aria-label", fmt.label + ", opens in a new tab");
+    }
+    return el;
+  }
+
+  // ---- The two checks (instructors) -----------------------------------
+
+  function _renderChecks(payload) {
+    if (!payload.job_id) return "";
+    return '<section class="reflow-pn-checks" aria-label="Accessibility checks">' +
+      _renderAccessibleCheck(payload) +
+      _renderOriginalCheck(payload) +
+      '</section>';
+  }
+
+  var _SEVERITY_WORD = { error: "Fix", warning: "Improve", info: "Review" };
+
+  function _renderAccessibleCheck(payload) {
+    var scored = payload.status === "scored" && typeof payload.score === "number";
+    var checks = payload.checks || null;
+    var verdict, tone;
+    if (!scored) {
+      verdict = String(payload.job_status || "") === "processing" ? "Being converted" : "Not checked yet";
+      tone = "muted";
+    } else if (checks && !checks.errors && !checks.warnings) {
+      verdict = "Passes the automated checks";
+      tone = "good";
+    } else if (checks) {
+      var parts = [];
+      if (checks.errors) parts.push(checks.errors + (checks.errors === 1 ? " problem" : " problems") + " to fix");
+      if (checks.warnings) parts.push(checks.warnings + (checks.warnings === 1 ? " thing" : " things") + " to improve");
+      verdict = parts.join(", ");
+      verdict = verdict.charAt(0).toUpperCase() + verdict.slice(1);
+      tone = checks.errors ? "problem" : "caution";
+    } else {
+      verdict = payload.score + " out of 100 on the automated checks";
+      tone = payload.score >= 90 ? "good" : (payload.score >= 67 ? "caution" : "problem");
+    }
+    var items = (checks && checks.items) || [];
+    var list = items.length
+      ? '<ul class="reflow-pn-check-items">' + items.slice(0, 4).map(function (it) {
+          var sev = it.severity in _SEVERITY_WORD ? it.severity : "info";
+          return '<li><span class="reflow-pn-sev reflow-pn-sev--' + sev + '">' + _SEVERITY_WORD[sev] + '</span> ' + esc(it.label) + '</li>';
+        }).join("") + '</ul>'
+      : "";
+    var score = scored
+      ? '<p class="reflow-pn-check-note">Automated score: ' + payload.score + ' out of 100. Automated checks find structure problems; they can’t judge whether descriptions are right.</p>'
+      : "";
+    var page = _canvasPageLink(payload);
+    var actions =
+      '<div class="reflow-pn-check-actions">' +
+      (page ? '<a class="reflow-pn-action" href="' + esc(page) + '" target="_blank" rel="noopener" aria-label="Open in Canvas, opens in a new tab">Open in Canvas</a>' : '') +
+      '<button class="reflow-pn-action reflow-pn-edit-btn" type="button">Edit</button>' +
+      '</div>';
+    return '<div class="reflow-pn-check reflow-pn-check--accessible">' +
+      '  <h3 class="reflow-pn-section-title">Accessible version</h3>' +
+      '  <p class="reflow-pn-check-verdict is-' + tone + '">' + esc(verdict) + '</p>' +
+      list + score + actions +
+      '</div>';
+  }
+
+  function _renderOriginalCheck(payload) {
+    var o = payload.original || null;
+    var body;
+    var how = '<p class="reflow-pn-check-note">Checked against PDF/UA-1 with <a href="https://verapdf.org" target="_blank" rel="noopener">veraPDF</a> when the file was uploaded.</p>';
+    if (!o) {
+      body = '<p class="reflow-pn-check-verdict is-muted">Not checked</p>' +
+        '<p class="reflow-pn-check-note">' + (/\.pdf$/i.test(payload.file_name || "")
+          ? "The PDF/UA check didn’t run for this file."
+          : "Only PDFs are checked against PDF/UA.") + '</p>';
+    } else {
+      var tone = o.verdict === "passes" ? "good" : "problem";
+      var problems = o.problems || [];
+      var shown = problems.filter(function (p) { return !(o.verdict === "untagged" && /has no tags/.test(p.label)); });
+      var lead = o.verdict === "untagged"
+        ? '<p class="reflow-pn-check-lead">Screen readers get no headings, lists or reading order from it.</p>'
+        : "";
+      var list = shown.length
+        ? '<ul class="reflow-pn-check-items reflow-pn-check-items--plain">' + shown.slice(0, 3).map(function (p) {
+            return '<li>' + esc(p.label) + '</li>';
+          }).join("") + '</ul>'
+        : "";
+      var all = problems.length
+        ? '<details class="reflow-pn-vrules">' +
+          '  <summary>All ' + problems.length + (problems.length === 1 ? ' problem' : ' problems') + ' veraPDF found</summary>' +
+          '  <ul class="reflow-pn-vrule-list">' + problems.map(function (p) {
+              return '<li><span class="reflow-pn-vrule-label">' + esc(p.label) + '</span>' +
+                '<span class="reflow-pn-vrule-desc">' + esc((p.rules || []).map(function (r) { return "Rule " + r; }).join(", ")) +
+                (p.detail ? ': ' + esc(p.detail) : '') + '</span></li>';
+            }).join("") + '</ul>' + how +
+          '</details>'
+        : how;
+      body = '<p class="reflow-pn-check-verdict is-' + tone + '">' + esc(o.headline) + '</p>' + lead + list + all;
+    }
+    return '<div class="reflow-pn-check reflow-pn-check--original">' +
+      '  <h3 class="reflow-pn-section-title">Original file</h3>' +
+      body +
+      '</div>';
   }
 
   // Faculty HTML editor with live preview. Loads canonical HTML from
@@ -991,13 +1115,13 @@
     overlay.className = "reflow-pn-editor";
     overlay.innerHTML =
       '<div class="reflow-pn-editor-card">' +
-      '  <header>' +
+      '  <div class="reflow-pn-editor-head">' +
       '    <div class="reflow-pn-editor-titles">' +
       '      <h2>Edit Accessible HTML</h2>' +
       '      <p>' + esc(filename || "Document") + ' <span id="reflow-pn-editor-state"></span></p>' +
       '    </div>' +
       '    <button class="reflow-pn-editor-close" type="button" aria-label="Close">&times;</button>' +
-      '  </header>' +
+      '  </div>' +
       '  <div class="reflow-pn-editor-toolbar" role="toolbar" aria-label="Formatting">' +
       '    <button type="button" data-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>' +
       '    <button type="button" data-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>' +
@@ -1023,7 +1147,7 @@
       '      <iframe class="reflow-pn-editor-preview" title="Live preview"></iframe>' +
       '    </div>' +
       '  </div>' +
-      '  <footer class="reflow-pn-editor-status"></footer>' +
+      '  <div class="reflow-pn-editor-status"></div>' +
       '</div>';
     document.body.appendChild(overlay);
 
@@ -1353,102 +1477,107 @@
       ".reflow-pn-dial{background:transparent;border:0;padding:0;margin:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;line-height:1;border-radius:50%;transition:transform 120ms,box-shadow 120ms;vertical-align:middle;}",
       ".reflow-pn-dial:hover{transform:scale(1.08);box-shadow:0 0 0 4px rgba(0,0,0,0.05);}",
       ".reflow-pn-dial:focus{outline:none;box-shadow:0 0 0 3px rgba(10,95,181,0.4);}",
-      // Modal
-      ".reflow-pn-modal{position:fixed;inset:0;background:rgba(15,20,30,0.55);display:flex;align-items:center;justify-content:center;z-index:99999;font:14px system-ui,sans-serif;color:#1d1d1d;}",
-      ".reflow-pn-modal-card{background:#fff;width:min(44rem,94vw);max-height:90vh;border-radius:12px;box-shadow:0 24px 64px rgba(15,20,30,0.22);display:flex;flex-direction:column;overflow:hidden;}",
-      ".reflow-pn-modal-header{display:flex;align-items:flex-start;justify-content:space-between;padding:1.25rem 1.5rem 0.75rem;border-bottom:1px solid #ececec;}",
-      ".reflow-pn-modal-titles h2{margin:0;font-size:1.05rem;font-weight:700;}",
-      ".reflow-pn-modal-titles p{margin:0.2rem 0 0;color:#666;font-size:0.85rem;}",
-      ".reflow-pn-edited{display:inline-block;background:#fff4cf;color:#8a5a00;border-radius:999px;padding:0 0.45rem;font-size:0.7rem;font-weight:700;margin-left:0.3rem;}",
-      ".reflow-pn-modal-close{background:none;border:0;font-size:1.5rem;cursor:pointer;color:#666;line-height:1;padding:0;margin-left:1rem;}",
-      ".reflow-pn-modal-report{display:flex;align-items:center;justify-content:space-between;padding:0.85rem 1.5rem;border-bottom:1px solid #f3f3f3;background:#fafafa;}",
-      ".reflow-pn-report-text{font-size:0.9rem;font-weight:600;display:flex;align-items:center;gap:0.5rem;}",
-      ".reflow-pn-pill{display:inline-block;padding:0.15rem 0.6rem;border-radius:999px;color:#fff;font-size:0.8rem;font-weight:700;}",
-      ".reflow-pn-pill-grey{background:#9aa0a6;}",
-      ".reflow-pn-pill-ok{background:#2e7d32;}",
-      // Before → after strip: original PDF estimate on the left, accessible
-      // version's WCAG score on the right, with an arrow between.
-      ".reflow-pn-beforeafter{display:inline-flex;align-items:center;gap:0.55rem;}",
-      ".reflow-pn-ba-item{display:inline-flex;flex-direction:column;align-items:center;gap:0.2rem;}",
-      ".reflow-pn-ba-item small{font-size:0.68rem;font-weight:600;color:#5b6573;text-transform:uppercase;letter-spacing:0.02em;}",
-      ".reflow-pn-ba-arrow{font-size:1.1rem;color:#9aa0a6;font-weight:700;}",
-      // Phase 8: Canvas-Page-primary banner. Prominent green CTA
-      // shown above the alt-format grid when an approved Canvas
-      // Page exists for the job.
-      ".reflow-pn-canvas-page-banner{padding:0.85rem 1.25rem;background:#e8f5ec;border-bottom:1px solid #b4dabe;}",
-      ".reflow-pn-canvas-page-link{display:flex;align-items:center;gap:0.85rem;padding:0.7rem 0.95rem;background:#fff;border:1px solid #2e7d32;border-radius:8px;color:#103a1a;text-decoration:none;transition:background 120ms;}",
-      ".reflow-pn-canvas-page-link:hover{background:#dff2e4;}",
-      ".reflow-pn-canvas-page-link:focus{outline:2px solid #2e7d32;outline-offset:2px;}",
-      ".reflow-pn-canvas-page-icon{flex:0 0 auto;font-size:1.4rem;}",
-      ".reflow-pn-canvas-page-text{display:flex;flex-direction:column;gap:0.2rem;}",
-      ".reflow-pn-canvas-page-text strong{font-size:0.95rem;}",
-      ".reflow-pn-canvas-page-text small{font-size:0.78rem;color:#33493b;}",
-      // Student variant of the report strip: no score dial, positive
-      // confirmation copy. Hint text reads as one column under the pill.
-      ".reflow-pn-modal-report--student{flex-direction:column;align-items:flex-start;gap:0.25rem;padding:1rem 1.5rem;}",
-      ".reflow-pn-report-hint{font-size:0.83rem;color:#5b6573;font-weight:400;}",
-      // VeraPDF violations disclosure. Sits between the score header and
-      // the Canvas Page banner; collapsed by default so the modal stays
-      // scannable. Contrast tuned for WCAG 2.2 AA (4.5:1 vs surrounding
-      // backgrounds for the body text, 3:1 for the rule clause chip).
-      ".reflow-pn-vrules{border-bottom:1px solid #f3f3f3;background:#fff;}",
-      ".reflow-pn-vrules-summary{cursor:pointer;padding:0.85rem 1.5rem;font-size:0.9rem;color:#1d1d1d;font-weight:600;list-style:revert;}",
-      ".reflow-pn-vrules-summary:focus-visible{outline:2px solid #1565c0;outline-offset:2px;}",
-      ".reflow-pn-vrules-hint{font-size:0.83rem;color:#4a5260;font-weight:400;margin:0;padding:0 1.5rem 0.75rem;line-height:1.45;}",
-      ".reflow-pn-vrules-hint a{color:#0a52a5;text-decoration:underline;}",
-      ".reflow-pn-vrule-list{list-style:none;margin:0;padding:0 1.5rem 1rem;display:flex;flex-direction:column;gap:0.6rem;}",
-      ".reflow-pn-vrule{background:#f6f8fa;border:1px solid #d6dbe1;border-radius:6px;padding:0.6rem 0.85rem;}",
-      ".reflow-pn-vrule-head{display:flex;align-items:center;justify-content:space-between;gap:0.75rem;margin-bottom:0.3rem;}",
-      ".reflow-pn-vrule-clause{display:inline-block;background:#0a52a5;color:#fff;border-radius:4px;padding:0.1rem 0.45rem;font-size:0.74rem;font-weight:700;font-family:'SFMono-Regular',Menlo,Consolas,monospace;}",
-      ".reflow-pn-vrule-count{font-size:0.78rem;color:#4a5260;font-weight:600;}",
-      ".reflow-pn-vrule-desc{font-size:0.88rem;color:#1d1d1d;line-height:1.4;}",
-      // Student smart-default CTA. Big primary card, then a discreet
-      // ``More formats`` disclosure containing the full grid.
-      ".reflow-pn-student-cta{padding:1rem 1.5rem 0.5rem;display:flex;flex-direction:column;gap:0.75rem;}",
-      ".reflow-pn-student-primary{display:flex;align-items:center;gap:0.9rem;padding:0.95rem 1.1rem;border:1px solid #2e7d32;border-radius:10px;background:#f1f8f4;text-decoration:none;color:#103a1a;transition:background 120ms,box-shadow 120ms,transform 120ms;}",
-      ".reflow-pn-student-primary:hover{background:#e6f3ea;box-shadow:0 2px 8px rgba(46,125,50,0.15);transform:translateY(-1px);}",
-      ".reflow-pn-student-primary:focus{outline:2px solid #2e7d32;outline-offset:2px;}",
-      ".reflow-pn-student-primary-icon{flex:0 0 auto;font-size:1.65rem;line-height:1;}",
-      ".reflow-pn-student-primary-text{display:flex;flex-direction:column;gap:0.15rem;}",
-      ".reflow-pn-student-primary-text strong{font-size:1rem;font-weight:700;}",
-      ".reflow-pn-student-primary-text small{font-size:0.82rem;color:#33493b;font-weight:400;}",
-      ".reflow-pn-more-formats{font-size:0.85rem;}",
-      ".reflow-pn-more-formats > summary{cursor:pointer;color:#0a5fb5;padding:0.25rem 0.4rem;border-radius:4px;list-style:none;font-weight:500;display:inline-flex;align-items:center;gap:0.25rem;}",
-      ".reflow-pn-more-formats > summary::after{content:'▾';font-size:0.7em;}",
-      ".reflow-pn-more-formats[open] > summary::after{content:'▴';}",
-      ".reflow-pn-more-formats > summary:hover{background:#eef4fc;}",
-      ".reflow-pn-more-formats > summary::-webkit-details-marker{display:none;}",
-      // Student ``More formats`` reveals the same grouped grid but at
-      // tighter padding (they came in via the big primary CTA above).
-      ".reflow-pn-more-formats .reflow-pn-modal-grid{padding:0.6rem 0 0.4rem;}",
-      ".reflow-pn-more-formats .reflow-pn-fmt-group-label{font-size:0.62rem;color:#7c8593;}",
-      ".reflow-pn-modal-tools{display:flex;align-items:center;gap:0.6rem;padding:0.7rem 1.5rem;background:#eef4fc;border-bottom:1px solid #cfdcec;font-size:0.85rem;}",
-      ".reflow-pn-edit-btn{background:#0a5fb5;color:#fff;border:0;padding:0.45rem 0.85rem;border-radius:6px;cursor:pointer;font-weight:600;}",
-      ".reflow-pn-edit-btn:hover{background:#084a91;}",
-      ".reflow-pn-tools-hint{color:#444;}",
-      // Grid is now a stack of grouped sections, each with its own
-      // auto-fit inner grid. ``minmax(11rem, 1fr)`` collapses to one
-      // column on narrow viewports and expands to two or three on
-      // wider modal widths without media-query plumbing.
-      ".reflow-pn-modal-grid{display:flex;flex-direction:column;gap:0.9rem;padding:1rem 1.5rem 1.1rem;overflow:auto;}",
-      ".reflow-pn-fmt-group{display:flex;flex-direction:column;gap:0.5rem;}",
-      ".reflow-pn-fmt-group-label{margin:0;font-size:0.68rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#6b7280;}",
-      ".reflow-pn-fmt-group-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:0.5rem;}",
-      // Card refinement: slightly softer border, squircle icon
-      // (border-radius 8px not 50%), refined hover (border shifts +
-      // subtle lift). Icon background opacity tuned down from 20 to
-      // 14 so the accent reads as accent, not a hard chip.
-      ".reflow-pn-fmt-card{display:flex;align-items:center;gap:0.7rem;padding:0.55rem 0.8rem;border:1px solid #e7e9ec;border-radius:8px;text-decoration:none;color:#1d1d1d;background:#fff;transition:border-color 120ms,transform 120ms,box-shadow 120ms;}",
-      ".reflow-pn-fmt-card:hover{border-color:#bfc4cb;transform:translateY(-1px);box-shadow:0 4px 12px rgba(15,20,30,0.07);}",
-      ".reflow-pn-fmt-card:focus-visible{outline:2px solid #0a5fb5;outline-offset:2px;border-color:#0a5fb5;}",
-      ".reflow-pn-fmt-card.is-disabled{cursor:not-allowed;pointer-events:none;background:#f7f7f8;color:#4b5563;}",
-      ".reflow-pn-fmt-card.is-disabled .reflow-pn-fmt-card-icon{filter:grayscale(1);opacity:0.55;}",
-      ".reflow-pn-fmt-card.is-busy{cursor:progress;border-color:#0a5fb5;}",
-      ".reflow-pn-fmt-card.is-busy .reflow-pn-fmt-card-label::after{content:' (preparing…)';font-weight:400;color:#4b5563;}",
-      ".reflow-pn-fmt-status{margin:0.6rem 0 0;font-size:0.85rem;color:#1f2937;min-height:1.2em;}",
-      ".reflow-pn-fmt-card-icon{flex:0 0 auto;width:1.9rem;height:1.9rem;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:0.95rem;line-height:1;}",
-      ".reflow-pn-fmt-card-label{flex:1;font-size:0.88rem;font-weight:500;line-height:1.25;}",
-      ".reflow-pn-fmt-card-soon{font-size:0.66rem;font-weight:700;color:#5c4400;background:#fff1c2;padding:0.12rem 0.45rem;border-radius:999px;white-space:nowrap;}",
+      // ---- Alternative Formats Menu ------------------------------------
+      // Canvas's own type (Lato) so the menu reads as part of the page; one
+      // accent, an iris violet, for the actions and focus; status colors
+      // only where they carry status. Every text color is at least 4.5:1
+      // on its background, and the tones pair a word with the color.
+      ".reflow-pn-modal{--pn-ink:#1c2733;--pn-slate:#4b5a6a;--pn-rule:#d9dfe5;--pn-wash:#f4f6f8;--pn-iris:#4c3fa0;--pn-iris-dark:#3b3082;--pn-iris-wash:#efedf9;--pn-good:#1b6e45;--pn-good-wash:#e6f2ec;--pn-caution:#8a5200;--pn-caution-wash:#fdf1dc;--pn-problem:#b42318;--pn-problem-wash:#fcebe9;" +
+        "position:fixed;inset:0;background:rgba(28,39,51,0.55);display:flex;align-items:center;justify-content:center;padding:1rem;box-sizing:border-box;z-index:99999;" +
+        "font:400 0.875rem/1.5 'Lato Extended',Lato,'Helvetica Neue',Helvetica,Arial,sans-serif;color:var(--pn-ink);}",
+      ".reflow-pn-modal *,.reflow-pn-modal *::before,.reflow-pn-modal *::after{box-sizing:border-box;}",
+      ".reflow-pn-modal-card{background:#fff;width:min(46rem,100%);max-height:calc(100vh - 2rem);border-radius:10px;box-shadow:0 20px 56px rgba(28,39,51,0.3);display:flex;flex-direction:column;overflow:hidden;}",
+      // The header and footer set their whole box: they sit in Canvas's
+      // page, whose own CSS can reach them.
+      ".reflow-pn-modal-header{flex:0 0 auto;position:static;display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;height:auto;min-height:0;margin:0;padding:1.25rem 1.5rem 1rem;background:#fff;border:0;border-bottom:1px solid var(--pn-rule);box-shadow:none;}",
+      ".reflow-pn-modal-titles{min-width:0;}",
+      ".reflow-pn-modal-titles h2{margin:0;font-size:1.125rem;line-height:1.35;font-weight:700;color:var(--pn-ink);overflow-wrap:anywhere;}",
+      ".reflow-pn-modal-titles p{margin:0.15rem 0 0;color:var(--pn-slate);font-size:0.8125rem;}",
+      ".reflow-pn-edited{display:inline-block;margin-left:0.5rem;padding:0 0.45rem;border-radius:4px;background:var(--pn-iris-wash);color:var(--pn-iris);font-size:0.75rem;font-weight:700;}",
+      ".reflow-pn-modal-close{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:2.25rem;height:2.25rem;margin:-0.35rem -0.5rem 0 0;border:0;border-radius:6px;background:transparent;color:var(--pn-slate);cursor:pointer;}",
+      ".reflow-pn-modal-close:hover{background:var(--pn-wash);color:var(--pn-ink);}",
+      ".reflow-pn-modal :focus-visible{outline:2px solid var(--pn-iris);outline-offset:2px;}",
+      ".reflow-pn-modal-body{flex:1 1 auto;min-height:0;overflow:auto;}",
+      ".reflow-pn-modal a.reflow-pn-format,.reflow-pn-modal a.reflow-pn-format:hover,.reflow-pn-modal a.reflow-pn-action:hover,.reflow-pn-modal a.reflow-pn-student-primary:hover{text-decoration:none;}",
+      ".reflow-pn-section-title{margin:0 0 0.4rem;font-size:0.9375rem;line-height:1.3;font-weight:700;color:var(--pn-ink);}",
+      // Notices (authorize, accept the disclaimer)
+      ".reflow-pn-notice{display:flex;align-items:center;gap:1rem;padding:0.85rem 1.5rem;background:var(--pn-caution-wash);border-bottom:1px solid var(--pn-rule);}",
+      ".reflow-pn-notice p{margin:0;flex:1;color:var(--pn-ink);}",
+      // Status row
+      ".reflow-pn-approval-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem 1rem;padding:0.85rem 1.5rem;background:var(--pn-wash);border-bottom:1px solid var(--pn-rule);}",
+      ".reflow-pn-approval-left{display:flex;align-items:baseline;gap:0.6rem;flex:1 1 18rem;min-width:0;}",
+      ".reflow-pn-approval-msg{color:var(--pn-slate);}",
+      ".reflow-pn-approval-actions{display:flex;flex-wrap:wrap;gap:0.5rem;}",
+      ".reflow-pn-status-badge{flex:0 0 auto;display:inline-flex;align-items:center;gap:0.4rem;font-weight:700;color:var(--pn-ink);}",
+      ".reflow-pn-status-badge::before{content:'';width:0.6rem;height:0.6rem;border-radius:50%;background:currentColor;}",
+      ".reflow-pn-tone--good{color:var(--pn-good);}",
+      ".reflow-pn-tone--caution{color:var(--pn-caution);}",
+      ".reflow-pn-tone--problem{color:var(--pn-problem);}",
+      ".reflow-pn-tone--muted{color:var(--pn-slate);}",
+      ".reflow-pn-pii-bar{flex-direction:column;align-items:stretch;}",
+      ".reflow-pn-pii-controls{display:flex;flex-direction:column;gap:0.4rem;}",
+      ".reflow-pn-pii-label{font-weight:700;font-size:0.8125rem;}",
+      ".reflow-pn-pii-justification{width:100%;font:inherit;padding:0.45rem 0.55rem;border:1px solid #8a96a3;border-radius:6px;resize:vertical;}",
+      // Buttons. Specific enough to stand apart from the editor's
+      // !important button rules, which share the old class names.
+      ".reflow-pn-modal .reflow-pn-action{display:inline-flex;align-items:center;justify-content:center;min-height:2.25rem;padding:0.4rem 0.9rem;border:1px solid #8a96a3;border-radius:6px;background:#fff;color:var(--pn-ink);font:inherit;font-weight:700;text-decoration:none;cursor:pointer;white-space:nowrap;}",
+      ".reflow-pn-modal .reflow-pn-action:hover{background:var(--pn-wash);border-color:var(--pn-slate);}",
+      ".reflow-pn-modal .reflow-pn-action--primary{background:var(--pn-iris);border-color:var(--pn-iris);color:#fff;}",
+      ".reflow-pn-modal .reflow-pn-action--primary:hover{background:var(--pn-iris-dark);border-color:var(--pn-iris-dark);}",
+      ".reflow-pn-modal .reflow-pn-action:disabled{opacity:0.6;cursor:wait;}",
+      // The two checks, side by side: what students get, then what was
+      // uploaded.
+      ".reflow-pn-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-bottom:1px solid var(--pn-rule);}",
+      ".reflow-pn-check{padding:1.1rem 1.5rem 1.25rem;}",
+      ".reflow-pn-check--original{border-left:1px solid var(--pn-rule);}",
+      ".reflow-pn-check-verdict{margin:0 0 0.35rem;font-size:1rem;font-weight:700;line-height:1.35;}",
+      ".reflow-pn-check-verdict.is-good{color:var(--pn-good);}",
+      ".reflow-pn-check-verdict.is-caution{color:var(--pn-caution);}",
+      ".reflow-pn-check-verdict.is-problem{color:var(--pn-problem);}",
+      ".reflow-pn-check-verdict.is-muted{color:var(--pn-slate);}",
+      ".reflow-pn-check-lead{margin:0 0 0.5rem;color:var(--pn-ink);}",
+      ".reflow-pn-check-items{list-style:none;margin:0 0 0.6rem;padding:0;display:flex;flex-direction:column;gap:0.3rem;}",
+      ".reflow-pn-check-items--plain li{position:relative;padding-left:0.9rem;}",
+      ".reflow-pn-check-items--plain li::before{content:'';position:absolute;left:0;top:0.55em;width:0.35rem;height:0.35rem;border-radius:50%;background:var(--pn-problem);}",
+      ".reflow-pn-sev{display:inline-block;min-width:3.6rem;margin-right:0.25rem;padding:0 0.35rem;border-radius:4px;font-size:0.75rem;font-weight:700;text-align:center;}",
+      ".reflow-pn-sev--error{background:var(--pn-problem-wash);color:var(--pn-problem);}",
+      ".reflow-pn-sev--warning{background:var(--pn-caution-wash);color:var(--pn-caution);}",
+      ".reflow-pn-sev--info{background:var(--pn-iris-wash);color:var(--pn-iris);}",
+      ".reflow-pn-check-note{margin:0 0 0.75rem;color:var(--pn-slate);font-size:0.8125rem;}",
+      ".reflow-pn-check-note a{color:var(--pn-iris);}",
+      ".reflow-pn-check-actions{display:flex;flex-wrap:wrap;gap:0.5rem;}",
+      ".reflow-pn-vrules{margin-top:0.25rem;}",
+      ".reflow-pn-vrules > summary{cursor:pointer;color:var(--pn-iris);font-weight:700;width:max-content;max-width:100%;}",
+      ".reflow-pn-vrule-list{list-style:none;margin:0.6rem 0;padding:0;display:flex;flex-direction:column;gap:0.55rem;}",
+      ".reflow-pn-vrule-label{display:block;font-weight:700;}",
+      ".reflow-pn-vrule-desc{display:block;color:var(--pn-slate);font-size:0.8125rem;}",
+      // Formats
+      ".reflow-pn-formats{padding:1.1rem 1.5rem 1.25rem;}",
+      ".reflow-pn-modal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0.75rem 1.5rem;}",
+      ".reflow-pn-fmt-group-label{margin:0 0 0.25rem;font-size:0.8125rem;font-weight:700;color:var(--pn-slate);}",
+      ".reflow-pn-fmt-list{list-style:none;margin:0;padding:0;}",
+      ".reflow-pn-format{display:grid;grid-template-columns:1fr auto;gap:0 0.75rem;margin:0 -0.6rem;padding:0.5rem 0.6rem;border-radius:6px;color:var(--pn-ink);text-decoration:none;}",
+      ".reflow-pn-format:hover{background:var(--pn-iris-wash);}",
+      ".reflow-pn-format-name{font-weight:700;color:var(--pn-iris);text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:0.18em;}",
+      ".reflow-pn-format-type{color:var(--pn-slate);font-size:0.75rem;align-self:center;white-space:nowrap;}",
+      ".reflow-pn-format-desc{grid-column:1 / -1;color:var(--pn-slate);font-size:0.8125rem;}",
+      ".reflow-pn-format.is-busy{cursor:progress;}",
+      ".reflow-pn-fmt-later{grid-column:1 / -1;margin:0.25rem 0 0;color:var(--pn-slate);font-size:0.8125rem;}",
+      ".reflow-pn-fmt-status{grid-column:1 / -1;margin:0;min-height:1.25em;font-weight:700;color:var(--pn-ink);}",
+      ".reflow-pn-fmt-status:empty{display:none;}",
+      // Students: the accessible version first
+      ".reflow-pn-student-cta{padding:1.25rem 1.5rem 0.25rem;}",
+      ".reflow-pn-student-primary{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;padding:0.85rem 1.1rem;border-radius:8px;background:var(--pn-iris);color:#fff;text-decoration:none;}",
+      ".reflow-pn-student-primary:hover{background:var(--pn-iris-dark);}",
+      ".reflow-pn-student-primary-text{font-size:1rem;font-weight:700;}",
+      ".reflow-pn-student-primary-hint{font-size:0.8125rem;opacity:0.9;}",
+      ".reflow-pn-student-note{margin:0.5rem 0 0;color:var(--pn-slate);font-size:0.8125rem;}",
+      // Footer
+      ".reflow-pn-modal-footer{flex:0 0 auto;position:static;height:auto;margin:0;padding:0.75rem 1.5rem;border:0;border-top:1px solid var(--pn-rule);background:var(--pn-wash);}",
+      ".reflow-pn-footer-text{margin:0;color:var(--pn-slate);font-size:0.8125rem;}",
+      ".reflow-pn-footer-text a{color:var(--pn-iris);}",
+      "@media (max-width:40rem){.reflow-pn-checks,.reflow-pn-modal-grid{grid-template-columns:1fr;}.reflow-pn-check--original{border-left:0;border-top:1px solid var(--pn-rule);}.reflow-pn-modal{padding:0.5rem;}.reflow-pn-modal-card{max-height:calc(100vh - 1rem);}}",
+      "@media (prefers-reduced-motion:reduce){.reflow-pn-modal *{transition:none !important;}}",
       // WCAG publication gate panel (only shown when the backend returns
       // a 409 with structured findings). Inline inside the approval bar
       // so faculty stays in flow.
@@ -1468,13 +1597,12 @@
       ".reflow-pn-wcag-confirm:hover{background:#166534;}",
       ".reflow-pn-wcag-cancel{background:#fff;border-color:#cdd3da;color:#1d1d1d;}",
       ".reflow-pn-wcag-cancel:hover{background:#f3f4f6;}",
-      ".reflow-pn-modal-footer{display:flex;align-items:center;justify-content:space-between;padding:0.7rem 1.5rem;border-top:1px solid #ececec;background:#fafafa;font-size:0.83rem;color:#444;}",
       // Editor
       ".reflow-pn-editor{position:fixed;inset:0;background:rgba(15,20,30,0.6);display:flex;align-items:center;justify-content:center;z-index:100000;font:14px system-ui,sans-serif;}",
       ".reflow-pn-editor-card{background:#fff;width:min(72rem,95vw);height:min(86vh,52rem);border-radius:10px;display:flex;flex-direction:column;box-shadow:0 30px 80px rgba(0,0,0,0.3);overflow:hidden;}",
-      ".reflow-pn-editor-card header{display:flex;align-items:flex-start;justify-content:space-between;padding:1rem 1.25rem 0.5rem;border-bottom:1px solid #ececec;flex-wrap:wrap;}",
-      ".reflow-pn-editor-card header h2{margin:0;font-size:1.05rem;}",
-      ".reflow-pn-editor-card header p{margin:0.15rem 0 0;color:#666;font-size:0.85rem;}",
+      ".reflow-pn-editor-card .reflow-pn-editor-head{display:flex;align-items:flex-start;justify-content:space-between;padding:1rem 1.25rem 0.5rem;border-bottom:1px solid #ececec;flex-wrap:wrap;}",
+      ".reflow-pn-editor-card .reflow-pn-editor-head h2{margin:0;font-size:1.05rem;}",
+      ".reflow-pn-editor-card .reflow-pn-editor-head p{margin:0.15rem 0 0;color:#666;font-size:0.85rem;}",
       // Stack the title + filename on the left so the filename doesn't float
       // in the middle of the header (flex space-between with 3 loose children).
       ".reflow-pn-editor-titles{display:flex;flex-direction:column;gap:0.1rem;min-width:0;flex:1;}",
@@ -1536,8 +1664,8 @@
       // on-top modal presentation matching the rest of the overlay.
       ".reflow-pn-lang-overlay{position:fixed;inset:0;background:rgba(15,20,30,0.55);display:flex;align-items:center;justify-content:center;z-index:100001;font:14px system-ui,sans-serif;color:#1d1d1d;}",
       ".reflow-pn-lang-card{width:min(36rem,92vw);max-height:80vh;overflow:auto;background:#fff;border-radius:10px;box-shadow:0 24px 64px rgba(0,0,0,0.3);display:flex;flex-direction:column;}",
-      ".reflow-pn-lang-card header{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.25rem;border-bottom:1px solid #ececec;}",
-      ".reflow-pn-lang-card header h2{margin:0;font-size:1.05rem;}",
+      ".reflow-pn-lang-card .reflow-pn-lang-head{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.25rem;border-bottom:1px solid #ececec;}",
+      ".reflow-pn-lang-card .reflow-pn-lang-head h2{margin:0;font-size:1.05rem;}",
       ".reflow-pn-lang-close{background:none;border:0;font-size:1.5rem;line-height:1;cursor:pointer;color:#666;padding:0;}",
       ".reflow-pn-lang-list{list-style:none;margin:0;padding:0.75rem;display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;}",
       ".reflow-pn-lang-list a{display:block;padding:0.55rem 0.75rem;border:1px solid #e6e6e6;border-radius:6px;text-decoration:none;color:#1d1d1d;background:#fff;}",
@@ -1552,55 +1680,22 @@
       ".reflow-pn-lang-custom{display:flex;align-items:center;gap:0.6rem;padding:0.75rem 1.5rem;border-top:1px solid #ececec;background:#fafafa;}",
       ".reflow-pn-lang-custom label{flex:1;font-size:0.85rem;color:#444;display:flex;flex-direction:column;gap:0.25rem;}",
       ".reflow-pn-lang-custom input{padding:0.45rem 0.65rem;border:1px solid #d6d8db;border-radius:5px;font:inherit;}",
-      // Consent banner + footer styles
-      // Approval gate bar — shown above the formats grid
-      ".reflow-pn-approval-bar{display:flex;align-items:center;justify-content:space-between;gap:0.75rem;margin:0.25rem 1.5rem 0;padding:0.65rem 0.9rem;background:#f4f7fb;border:1px solid #d6dee8;border-radius:6px;font-size:0.85rem;}",
-      ".reflow-pn-approval-left{display:flex;align-items:center;gap:0.7rem;flex:1;min-width:0;}",
-      ".reflow-pn-status-badge{display:inline-block;color:#fff;font-weight:700;font-size:0.72rem;letter-spacing:0.05em;padding:0.25rem 0.55rem;border-radius:4px;}",
-      ".reflow-pn-approval-msg{color:#1a2233;flex:1;}",
-      ".reflow-pn-approval-actions{display:flex;gap:0.5rem;flex-shrink:0;}",
-      // PII privacy-review bar: stack the explanation, reason box, and
-      // Approve/Deny buttons so the textarea gets full width.
-      ".reflow-pn-pii-bar{flex-direction:column;align-items:stretch;gap:0.6rem;}",
-      ".reflow-pn-pii-controls{display:flex;flex-direction:column;gap:0.5rem;}",
-      ".reflow-pn-pii-justification{width:100%;font:inherit;font-size:0.85rem;padding:0.45rem 0.55rem;border:1px solid #c7d0db;border-radius:5px;resize:vertical;box-sizing:border-box;}",
       ".reflow-pn-btn-primary{background:#2e7d32;color:#fff;border:none;padding:0.4rem 0.9rem;border-radius:5px;font-weight:600;cursor:pointer;font:inherit;}",
       ".reflow-pn-btn-primary:hover{background:#256527;}",
       ".reflow-pn-btn-primary:disabled{background:#9ec5a0;cursor:wait;}",
       ".reflow-pn-btn-secondary{background:#fff;color:#1a2233;border:1px solid #c8cfd9;padding:0.4rem 0.9rem;border-radius:5px;cursor:pointer;font:inherit;}",
-      ".reflow-pn-btn-secondary:hover{background:#f4f7fb;border-color:#a4b0c1;}",
-      ".reflow-pn-consent-banner{display:flex;align-items:center;gap:0.6rem;margin:0.25rem 1.5rem 0;padding:0.7rem 0.9rem;background:#fff4e5;border:1px solid #f0b878;border-radius:6px;font-size:0.85rem;color:#5d4014;}",
-      ".reflow-pn-consent-icon{font-size:1.1rem;}",
-      ".reflow-pn-consent-text{flex:1;}",
-      ".reflow-pn-consent-btn{display:inline-block;padding:0.35rem 0.85rem;background:#1f4e79;color:#fff !important;text-decoration:none;border-radius:5px;font-weight:600;font-size:0.8rem;}",
-      ".reflow-pn-consent-btn:hover{background:#163960;}",
-      ".reflow-pn-footer-text{font-size:0.8rem;color:#5d6b85;}",
-      ".reflow-pn-footer-text a{color:#1f4e79;text-decoration:underline;}",
-      ".reflow-pn-consent-ok{color:#2e7d32;font-weight:700;}"
+      ".reflow-pn-btn-secondary:hover{background:#f4f7fb;border-color:#a4b0c1;}"
     ].join("\n");
     document.head.appendChild(s);
   }
 
-  // Render the consent banner shown at the top of the formats modal. For
-  // students (and for instructors who have already consented) this is
-  // empty; for instructors who haven't consented (or whose consent is
-  // stale due to a version bump) it surfaces a prompt to authorize.
-  // Render the Canvas-OAuth authorization prompt. Shown only to instructors
-  // who have an LTI session but have NOT yet authorized Reflow against the
-  // Canvas API — the state in which the watcher/bridge silently can't act.
-  // The button opens a popup (see openAuthPopup) rather than navigating the
-  // whole window away. Returns "" for students, for already-authorized
-  // instructors, and when status is still unknown (avoid false alarms).
   function _renderAuthBanner() {
     var o = STATE.oauth;
     if (!o || o.authorized) return "";
     if (!o.is_instructor && STATE.userRole !== "Instructor") return "";
-    var msg = "Authorize Iris to read your course files and publish accessible pages. " +
-              "Until you do, new uploads won't be converted in your courses.";
-    return '<section id="reflow-pn-auth-banner" class="reflow-pn-consent-banner" role="status">' +
-           '  <span class="reflow-pn-consent-icon" aria-hidden="true">🔑</span>' +
-           '  <span class="reflow-pn-consent-text">' + esc(msg) + '</span>' +
-           '  <button class="reflow-pn-consent-btn reflow-pn-auth-btn" type="button">Authorize Iris</button>' +
+    return '<section id="reflow-pn-auth-banner" class="reflow-pn-notice" role="status">' +
+           '  <p>Connect Iris to your Canvas account so it can read your course files and publish accessible pages. New uploads aren’t converted until you do.</p>' +
+           '  <button class="reflow-pn-action reflow-pn-action--primary reflow-pn-auth-btn" type="button">Authorize Iris</button>' +
            '</section>';
   }
 
@@ -1609,144 +1704,32 @@
     if (c.agreed) return "";
     // Don't nag students — only instructors trigger paid processing.
     if (STATE.userRole !== "Instructor") return "";
-    var msg = "Authorization required to process new documents through the AI provider.";
-    if (c.reason === "version_changed") {
-      msg = "The Iris disclaimer has been updated. Please re-authorize to continue using the tool.";
-    }
-    return '<section id="reflow-pn-consent-banner" class="reflow-pn-consent-banner" role="status">' +
-           '  <span class="reflow-pn-consent-icon" aria-hidden="true">⚠️</span>' +
-           '  <span class="reflow-pn-consent-text">' + esc(msg) + '</span>' +
-           '  <a class="reflow-pn-consent-btn" href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">Authorize Iris</a>' +
+    var msg = c.reason === "version_changed"
+      ? "The Iris disclaimer has changed. Accept it again to keep converting documents."
+      : "Accept the Iris disclaimer before Iris converts documents in your courses.";
+    return '<section id="reflow-pn-consent-banner" class="reflow-pn-notice" role="status">' +
+           '  <p>' + esc(msg) + '</p>' +
+           '  <a class="reflow-pn-action reflow-pn-action--primary" href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">Read and accept</a>' +
            '</section>';
   }
 
-  // Render the footer line — always shown so faculty always know what's
-  // happening with their data. Tone is informational, not nagging.
+  function _consentAgreedText(c) {
+    var when = fmtConsentDate(c.agreed_at);
+    return 'You accepted the Iris disclaimer' + (when ? ' on ' + esc(when) : '') + '. ' +
+           '<a href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">Read it again</a>';
+  }
+
+  // The footer line: instructors always know whether Iris may process
+  // their documents. Informational, not nagging.
   function _renderConsentFooter() {
     var c = STATE.consent || { agreed: false, reason: "unknown" };
-    if (c.agreed) {
-      var when = fmtConsentDate(c.agreed_at);
-      return '<span class="reflow-pn-footer-text">' +
-             '  <span class="reflow-pn-consent-ok" aria-hidden="true">✓</span> ' +
-             '  Authorized' + (when ? ' on ' + esc(when) : '') +
-             '  · <a href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">View terms</a>' +
-             '</span>';
-    }
-    if (STATE.userRole === "Instructor") {
-      return '<span class="reflow-pn-footer-text">' +
-             '  Alternative formats are visible to students. ' +
-             '  <a href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">View Iris authorization terms</a>' +
-             '</span>';
-    }
-    return '<span class="reflow-pn-footer-text">Alternative formats are visible to students.</span>';
+    var text = c.agreed
+      ? _consentAgreedText(c)
+      : 'Iris converts documents only after you accept its disclaimer. ' +
+        '<a href="' + ORIGIN + '/canvas/consent" target="_blank" rel="noopener">Read the disclaimer</a>';
+    return '<p class="reflow-pn-footer-text">' + text + '</p>';
   }
 
-  // Render the approval gate strip inside the formats modal. Shows the
-  // current status (DRAFT / APPROVED / REJECTED), and — for instructors —
-  // the Approve / Reject / Request-Edits buttons.
-  // Header strip shown above the format grid. Instructors see the
-  // standard accessibility score (the data point that prompts them to
-  // act on a low-scoring document). Students get a positive
-  // confirmation that an accessible version exists, since the raw
-  // score is not actionable from their side.
-  function _renderVerapdfViolations(payload) {
-    // Only render when an actual VeraPDF audit produced violations.
-    // The heuristic source_score path doesn't surface anything here —
-    // it has no per-rule data to list.
-    if (STATE.userRole !== "Instructor") return "";
-    if (payload.source_score_provenance !== "verapdf") return "";
-    var violations = Array.isArray(payload.verapdf_violations) ? payload.verapdf_violations : [];
-    if (!violations.length) return "";
-    // Group identical rule_ids defensively in case the backend ever
-    // duplicates them. Sort by occurrence_count descending so the most
-    // pervasive issues read first.
-    var sorted = violations.slice().sort(function (a, b) {
-      return (b.occurrence_count || 0) - (a.occurrence_count || 0);
-    });
-    var items = sorted.map(function (v) {
-      var occ = v.occurrence_count || 1;
-      var clauseRef = v.clause
-        ? '<code class="reflow-pn-vrule-clause">PDF/UA &sect;' + esc(String(v.clause)) + '</code>'
-        : '';
-      var occText = occ === 1 ? '1 instance' : (occ + ' instances');
-      return '<li class="reflow-pn-vrule">' +
-             '  <div class="reflow-pn-vrule-head">' + clauseRef +
-             '    <span class="reflow-pn-vrule-count">' + esc(occText) + '</span>' +
-             '  </div>' +
-             '  <div class="reflow-pn-vrule-desc">' + esc(String(v.description || v.rule_id || "Rule violation")) + '</div>' +
-             '</li>';
-    }).join("");
-    var summary = sorted.length === 1
-      ? "1 PDF/UA rule failed on the original PDF"
-      : (sorted.length + " PDF/UA rules failed on the original PDF");
-    return '<details class="reflow-pn-vrules">' +
-           '  <summary class="reflow-pn-vrules-summary">' +
-           '    <span>Why this score? &middot; ' + esc(summary) + '</span>' +
-           '  </summary>' +
-           '  <p class="reflow-pn-vrules-hint">' +
-           '    These rules come from <a href="https://verapdf.org" target="_blank" rel="noopener">veraPDF</a>, ' +
-           '    the PDF Association\'s PDF/UA-1 validator. Each maps to a WCAG 2.x criterion. ' +
-           '    Fixing them in the source PDF (with Acrobat, PAC 2024, or your authoring tool) ' +
-           '    will improve the score on the next re-conversion.' +
-           '  </p>' +
-           '  <ol class="reflow-pn-vrule-list">' + items + '</ol>' +
-           '</details>';
-  }
-
-  function _renderReportHeader(payload, score, color) {
-    var isInstructor = STATE.userRole === "Instructor";
-    if (isInstructor) {
-      // Two independent measurements — NOT a before/after of the same
-      // thing. Faculty correctly flagged the older labelling as
-      // misleading when the right number was lower than the left. The
-      // two scores use different tools (veraPDF vs. our WCAG subset),
-      // different documents (PDF vs. HTML), and different formulas
-      // (proportional vs. penalty-based) so direct comparison isn't
-      // meaningful.
-      var hasSource = typeof payload.source_score === "number";
-      var srcSev = payload.source_severity || severityFor(payload.source_score);
-      var srcColor = COLORS[srcSev] || COLORS.unscanned;
-      var srcPill = hasSource
-        ? '<span class="reflow-pn-pill" style="background:' + srcColor + '">' + payload.source_score + '%</span>'
-        : '<span class="reflow-pn-pill reflow-pn-pill-grey">not audited</span>';
-      var htmlPill = (score === null)
-        ? '<span class="reflow-pn-pill reflow-pn-pill-grey">not yet scored</span>'
-        : '<span class="reflow-pn-pill" style="background:' + color + '">' + score + '%</span>';
-      return '<section class="reflow-pn-modal-report">' +
-        '  <div class="reflow-pn-report-text">' +
-        '    <span class="reflow-pn-report-label">Two accessibility measurements</span>' +
-        '    <span class="reflow-pn-beforeafter">' +
-        '      <span class="reflow-pn-ba-item"><small>Original PDF — PDF/UA-1 (veraPDF)</small>' + srcPill + '</span>' +
-        '      <span class="reflow-pn-ba-arrow" aria-hidden="true">·</span>' +
-        '      <span class="reflow-pn-ba-item"><small>Generated HTML — WCAG checks</small>' + htmlPill + '</span>' +
-        '    </span>' +
-        '    <span class="reflow-pn-report-hint reflow-pn-report-hint-inline">' +
-        '      <strong>These are not directly comparable.</strong> ' +
-        '      The left number is veraPDF’s PDF/UA-1 validation of the original PDF (fraction of ~1000 rules passing). ' +
-        '      The right number is our WCAG structural check subset on the generated HTML ' +
-        '      (penalty-based: one error costs 12 points). They measure two different documents with two different tools — ' +
-        '      a number being lower on either side does NOT mean accessibility regressed.' +
-        '    </span>' +
-        '  </div>' +
-        '  <div class="reflow-pn-report-dial"></div>' +
-        '</section>';
-    }
-    // Student variant. We only render this modal at all when a job
-    // exists and (per the approval gate) is in a state the student can
-    // see — so the language can be confident.
-    return '<section class="reflow-pn-modal-report reflow-pn-modal-report--student">' +
-      '  <div class="reflow-pn-report-text">' +
-      '    <span class="reflow-pn-pill reflow-pn-pill-ok">✓ Accessible version available</span>' +
-      '  </div>' +
-      '  <div class="reflow-pn-report-hint">Choose a format that works for you.</div>' +
-      '</section>';
-  }
-
-  // Phase 8: when an approved Canvas Page exists, promote it to a
-  // prominent "primary" link so faculty + students see it BEFORE the
-  // alternate-format grid. The original PDF in Canvas's Files UI is
-  // labeled secondary; this banner is the route to the
-  // student-facing accessible version.
   // Resolve a job's Canvas Page reference into a full, openable URL.
   // Canvas's pages API returns ``url`` as a bare slug (e.g. "my-page"),
   // and older jobs stored exactly that. A bare slug rendered as an href
@@ -1764,50 +1747,23 @@
     return location.origin + "/courses/" + course + "/pages/" + slug;
   }
 
-  function _renderCanvasPageBanner(payload) {
-    if (!payload || !payload.canvas_page_url) return "";
-    var href = _canvasPageHref(payload);
-    if (!href) return "";
-    var isStudent = STATE.userRole !== "Instructor";
-    var label = isStudent
-      ? "📘 Open the accessible Canvas page (primary)"
-      : "📘 Open accessible Canvas page (this is the primary student-facing artifact)";
-    return '<section class="reflow-pn-canvas-page-banner" aria-label="Primary accessible version">' +
-      '  <a class="reflow-pn-canvas-page-link" target="_blank" rel="noopener" href="' +
-      esc(href) + '">' +
-      '    <span class="reflow-pn-canvas-page-icon" aria-hidden="true">📘</span>' +
-      '    <span class="reflow-pn-canvas-page-text">' +
-      '      <strong>' + esc(label) + '</strong>' +
-      '      <small>The original PDF below is kept as a source copy. The reviewed Canvas Page above is the accessible version intended for student use.</small>' +
-      '    </span>' +
-      '  </a>' +
-      '</section>';
-  }
+  // Where the document stands, and what the instructor can do about it.
+  // A status word with its tone, one sentence, and the actions. The
+  // buttons carry ``data-action`` (see _wireApprovalActions).
+  var _STATUS = {
+    published:         { word: "Published",       tone: "good",    msg: "Students can open the accessible version and every format below." },
+    awaiting_review:   { word: "Draft",           tone: "caution", msg: "Students can’t see it until you publish." },
+    rejected:          { word: "Rejected",        tone: "problem", msg: "Hidden from students." },
+    page_failed:       { word: "Draft",           tone: "caution", msg: "The Canvas page couldn’t be created. Authorize Iris again, then publish." },
+    processing:        { word: "Converting",      tone: "muted",   msg: "Iris is converting this file. Check back in a few minutes." },
+    processing_queued: { word: "Converting",      tone: "muted",   msg: "Waiting for Iris. Check back in a few minutes." },
+    pii_scanning:      { word: "Converting",      tone: "muted",   msg: "Iris is converting this file. Check back in a few minutes." },
+    failed:            { word: "Needs attention", tone: "problem", msg: "The conversion didn’t finish." },
+    denied:            { word: "Needs attention", tone: "problem", msg: "Processing was denied." }
+  };
 
-  // The body of the modal — formats. Instructors get the full grid of
-  // every available format (HTML, audio, EPUB, OCR, Braille, etc.).
-  // Students get a smart-default: a single prominent "Open accessible
-  // version" CTA that links directly to Accessible HTML, with a
-  // discreet "More formats ▾" expander that reveals the same grid for
-  // anyone who needs audio, EPUB, Braille, translation, etc.
-  function _renderFormatBody(payload) {
-    var isInstructor = STATE.userRole === "Instructor";
-    if (isInstructor) {
-      return '<section class="reflow-pn-modal-grid"></section>';
-    }
-    return '<section class="reflow-pn-student-cta">' +
-      '  <a class="reflow-pn-student-primary" data-fmt="html" href="#" target="_blank" rel="noopener">' +
-      '    <span class="reflow-pn-student-primary-icon" aria-hidden="true">📖</span>' +
-      '    <span class="reflow-pn-student-primary-text">' +
-      '      <strong>Open accessible version</strong>' +
-      '      <small>Reader-friendly HTML with proper headings, alt text, and reading order.</small>' +
-      '    </span>' +
-      '  </a>' +
-      '  <details class="reflow-pn-more-formats">' +
-      '    <summary>More formats</summary>' +
-      '    <div class="reflow-pn-modal-grid"></div>' +
-      '  </details>' +
-      '</section>';
+  function _statusChip(word, tone) {
+    return '<span class="reflow-pn-status-badge reflow-pn-tone--' + tone + '">' + esc(word) + '</span>';
   }
 
   function _renderApprovalBar(payload) {
@@ -1816,81 +1772,47 @@
     var isInstructor = STATE.userRole === "Instructor";
 
     // Privacy (PII) review: Reflow paused the conversion pending a human
-    // decision. Surface Approve/Deny right here so faculty can act in one
-    // click instead of hunting through the formats.
+    // decision. Only documents Reflow converted reach this state.
     if (status === "awaiting_approval") {
       if (!isInstructor) {
         return '<section class="reflow-pn-approval-bar" data-status="awaiting_approval">' +
-               '  <div class="reflow-pn-approval-left">' +
-               '    <span class="reflow-pn-status-badge" style="background:' + COLORS.amber + '">PRIVACY REVIEW</span>' +
-               '    <span class="reflow-pn-approval-msg">This document is awaiting a privacy review by your instructor.</span>' +
+               '  <div class="reflow-pn-approval-left">' + _statusChip("Privacy review", "caution") +
+               '    <span class="reflow-pn-approval-msg">Your instructor is reviewing this document.</span>' +
                '  </div>' +
                '</section>';
       }
       return '<section class="reflow-pn-approval-bar reflow-pn-pii-bar" data-status="awaiting_approval">' +
-             '  <div class="reflow-pn-approval-left">' +
-             '    <span class="reflow-pn-status-badge" style="background:' + COLORS.amber + '">PRIVACY REVIEW</span>' +
-             '    <span class="reflow-pn-approval-msg">Reflow flagged possible personal or sensitive information in this document. Approve to finish generating accessible formats, or deny to discard it. Your decision is logged.</span>' +
+             '  <div class="reflow-pn-approval-left">' + _statusChip("Privacy review", "caution") +
+             '    <span class="reflow-pn-approval-msg">Reflow flagged possible personal or sensitive information. Approve to finish the accessible formats, or deny to discard the document. Your decision is logged.</span>' +
              '  </div>' +
              '  <div class="reflow-pn-pii-controls">' +
-             '    <textarea class="reflow-pn-pii-justification" rows="2" maxlength="1000" aria-label="Reason for your privacy decision (required)">Reviewed by faculty in Canvas.</textarea>' +
+             '    <label class="reflow-pn-pii-label" for="reflow-pn-pii-why">Reason for your decision</label>' +
+             '    <textarea id="reflow-pn-pii-why" class="reflow-pn-pii-justification" rows="2" maxlength="1000">Reviewed by faculty in Canvas.</textarea>' +
              '    <div class="reflow-pn-approval-actions">' +
-             '      <button class="reflow-pn-btn-primary" type="button" data-action="pii_approve">✓ Approve &amp; continue</button>' +
-             '      <button class="reflow-pn-btn-secondary" type="button" data-action="pii_deny">Deny</button>' +
+             '      <button class="reflow-pn-action reflow-pn-action--primary" type="button" data-action="pii_approve">Approve and continue</button>' +
+             '      <button class="reflow-pn-action" type="button" data-action="pii_deny">Deny</button>' +
              '    </div>' +
              '  </div>' +
              '</section>';
     }
 
-    // Converting / scanning: tell the professor it's still in flight.
-    if (status === "processing" || status === "pii_scanning" || status === "processing_queued") {
-      return '<section class="reflow-pn-approval-bar" data-status="' + esc(status) + '">' +
-             '  <div class="reflow-pn-approval-left">' +
-             '    <span class="reflow-pn-status-badge" style="background:' + COLORS.unscanned + '">CONVERTING</span>' +
-             '    <span class="reflow-pn-approval-msg">This file is still being processed. Check back shortly.</span>' +
-             '  </div>' +
-             '</section>';
-    }
-    // Failed: tell the professor *why*, and what they can do about it.
-    if (status === "failed" || status === "denied") {
-      var reason = payload.error ? esc(payload.error) : "Conversion did not complete.";
-      var hint = isInstructor
-        ? " Re-upload the file to retry. Very large PDFs may need splitting; scanned/image-only PDFs are auto-OCR'd on retry."
-        : "";
-      return '<section class="reflow-pn-approval-bar" data-status="' + esc(status) + '">' +
-             '  <div class="reflow-pn-approval-left">' +
-             '    <span class="reflow-pn-status-badge" style="background:' + COLORS.red + '">NEEDS ATTENTION</span>' +
-             '    <span class="reflow-pn-approval-msg">' + reason + hint + '</span>' +
-             '  </div>' +
-             '</section>';
-    }
-    var label, color, msg;
-    if (status === "published") {
-      label = "APPROVED";
-      color = "#2e7d32";
-      msg = "This version is visible to students.";
-    } else if (status === "rejected") {
-      label = "REJECTED";
-      color = "#b00020";
-      msg = "This version is hidden from students.";
-    } else {
-      label = "DRAFT";
-      color = "#cc7a00";
-      msg = "Students cannot see alternative formats until you approve.";
-    }
+    var s = _STATUS[status] || _STATUS.awaiting_review;
+    var msg = s.msg;
+    if ((status === "failed" || status === "denied") && payload.error) msg = String(payload.error);
     var buttons = "";
     if (isInstructor) {
-      if (status === "awaiting_review" || status === "rejected") {
-        buttons = '<button class="reflow-pn-approve-btn reflow-pn-btn-primary" type="button" data-action="approve">✓ Approve &amp; publish</button>'
-                + (status === "awaiting_review" ? '<button class="reflow-pn-reject-btn reflow-pn-btn-secondary" type="button" data-action="reject">Reject</button>' : '');
+      if (status === "awaiting_review" || status === "rejected" || status === "page_failed") {
+        buttons = '<button class="reflow-pn-action reflow-pn-action--primary reflow-pn-approve-btn" type="button" data-action="approve">Publish</button>' +
+                  (status === "awaiting_review" ? '<button class="reflow-pn-action reflow-pn-reject-btn" type="button" data-action="reject">Reject</button>' : '');
       } else if (status === "published") {
-        buttons = '<button class="reflow-pn-reedit-btn reflow-pn-btn-secondary" type="button" data-action="request_edits">↺ Request edits</button>'
-                + '<button class="reflow-pn-unpublish-btn reflow-pn-btn-secondary" type="button" data-action="unpublish" title="Hide this accessible version from students and unpublish its Canvas page">⊘ Unpublish</button>';
+        // Unpublish hides the formats and the Canvas page. ("Request edits"
+        // hid only the formats and left the page up; Edit works on a
+        // published document, so one way back to draft is enough.)
+        buttons = '<button class="reflow-pn-action reflow-pn-unpublish-btn" type="button" data-action="unpublish">Unpublish</button>';
       }
     }
     return '<section class="reflow-pn-approval-bar" data-status="' + esc(status) + '">' +
-           '  <div class="reflow-pn-approval-left">' +
-           '    <span class="reflow-pn-status-badge" style="background:' + color + '">' + label + '</span>' +
+           '  <div class="reflow-pn-approval-left">' + _statusChip(s.word, s.tone) +
            '    <span class="reflow-pn-approval-msg">' + esc(msg) + '</span>' +
            '  </div>' +
            '  <div class="reflow-pn-approval-actions">' + buttons + '</div>' +
@@ -1971,30 +1893,27 @@
   // Replace the approval bar contents with the success state for the
   // given action. Pulled out so the multi-pass WCAG-gate flow can call
   // it after the resubmit succeeds.
-  function _showApprovalSuccess(bar, action) {
-    var pubBadge, pubColor, pubMsg;
-    if (action === "approve") {
-      pubBadge = "APPROVED"; pubColor = "#2e7d32";
-      pubMsg = "Published — this accessible version is now visible to students.";
-    } else if (action === "reject") {
-      pubBadge = "REJECTED"; pubColor = "#b00020";
-      pubMsg = "Rejected — this version is hidden from students.";
-    } else if (action === "unpublish") {
-      pubBadge = "DRAFT"; pubColor = "#cc7a00";
-      pubMsg = "Unpublished — hidden from students and removed from the Pages list. Re-publish anytime with Approve & publish.";
-    } else {
-      pubBadge = "DRAFT"; pubColor = "#cc7a00";
-      pubMsg = "Pulled back to draft for more edits.";
-    }
+  function _showApprovalSuccess(bar, action, payload) {
+    _restatusDials(payload && payload.job_id, action);
+    var done = {
+      approve:       ["Published", "good", "Students can open the accessible version and every format now."],
+      reject:        ["Rejected", "problem", "Hidden from students."],
+      unpublish:     ["Draft", "caution", "Unpublished: hidden from students and from the course’s Pages. Publish again at any time."],
+      request_edits: ["Draft", "caution", "Back to draft. Students can’t see the formats until you publish again."]
+    }[action] || ["Draft", "caution", "Saved."];
     var pubActions = bar.querySelector(".reflow-pn-approval-actions");
     if (pubActions) pubActions.remove();
     var pubGate = bar.querySelector(".reflow-pn-wcag-gate");
     if (pubGate) pubGate.remove();
     var pubLeft = bar.querySelector(".reflow-pn-approval-left");
     if (pubLeft) {
-      pubLeft.innerHTML =
-        '<span class="reflow-pn-status-badge" style="background:' + pubColor + '">' + pubBadge + '</span>' +
-        '<span class="reflow-pn-approval-msg">' + esc(pubMsg) + '</span>';
+      pubLeft.innerHTML = _statusChip(done[0], done[1]) +
+        '<span class="reflow-pn-approval-msg">' + esc(done[2]) + '</span>';
+      pubLeft.setAttribute("role", "status");
+      // The button that was pressed is gone; the result takes focus, so a
+      // screen reader reads it and the keyboard stays in the dialog.
+      pubLeft.setAttribute("tabindex", "-1");
+      try { pubLeft.focus(); } catch (_) { /* defensive */ }
     }
   }
 
@@ -2022,8 +1941,8 @@
     ];
 
     var html = '<div class="reflow-pn-wcag-gate" role="region" aria-label="Publication gate">' +
-      '<h3 class="reflow-pn-wcag-gate-title">Before you publish — quick review</h3>' +
-      '<p class="reflow-pn-wcag-gate-hint">Confirm you have visually reviewed these items. Anything an automated check found that you cannot fix in the editor can be waived with a reason.</p>' +
+      '<h3 class="reflow-pn-wcag-gate-title">Before you publish</h3>' +
+      '<p class="reflow-pn-wcag-gate-hint">Confirm you checked each of these. Anything the automated checks found that you can\u2019t fix in the editor can be waived with a reason.</p>' +
       '<ul class="reflow-pn-wcag-checklist">';
     checklistItems.forEach(function (item) {
       var checked = !!gateState.checklist[item.id];
@@ -2052,8 +1971,8 @@
     }
 
     html += '<div class="reflow-pn-wcag-gate-actions">' +
-            '  <button class="reflow-pn-btn-primary reflow-pn-wcag-confirm" type="button">✓ Confirm and publish</button>' +
-            '  <button class="reflow-pn-btn-secondary reflow-pn-wcag-cancel" type="button">Cancel</button>' +
+            '  <button class="reflow-pn-action reflow-pn-action--primary reflow-pn-wcag-confirm" type="button">Publish</button>' +
+            '  <button class="reflow-pn-action reflow-pn-wcag-cancel" type="button">Cancel</button>' +
             '</div>' +
             '</div>';
 
@@ -2091,7 +2010,7 @@
       if (actions) actions.style.display = "";
       // Re-enable the approve button so faculty can try again or pivot.
       var ab = actions && actions.querySelector('button[data-action="approve"]');
-      if (ab) { ab.disabled = false; ab.textContent = "✓ Approve & publish"; }
+      if (ab) { ab.disabled = false; ab.textContent = "Publish"; }
     });
   }
 
@@ -2138,8 +2057,7 @@
             if (c409) c409.remove();
             var l409 = bar.querySelector(".reflow-pn-approval-left");
             if (l409) {
-              l409.innerHTML =
-                '<span class="reflow-pn-status-badge" style="background:#2e7d32">DONE</span>' +
+              l409.innerHTML = _statusChip("Done", "good") +
                 '<span class="reflow-pn-approval-msg">This document already cleared the privacy review and finished converting. Close and reopen this menu to see the latest.</span>';
             }
             return;
@@ -2156,9 +2074,7 @@
           var left = bar.querySelector(".reflow-pn-approval-left");
           if (left) {
             left.innerHTML =
-              '<span class="reflow-pn-status-badge" style="background:' +
-              (decision === "approved" ? "#2e7d32" : "#b00020") + '">' +
-              (decision === "approved" ? "APPROVED" : "DENIED") + '</span>' +
+              (decision === "approved" ? _statusChip("Approved", "good") : _statusChip("Denied", "problem")) +
               '<span class="reflow-pn-approval-msg">' +
               (decision === "approved"
                 ? "Approved. Reflow is finishing the conversion — the accessible page will appear in a minute or two."
@@ -2167,7 +2083,7 @@
           }
         } catch (err) {
           btn.disabled = false;
-          btn.textContent = decision === "approved" ? "✓ Approve & continue" : "Deny";
+          btn.textContent = decision === "approved" ? "Approve and continue" : "Deny";
           window.alert("Privacy decision failed: " + err.message);
         }
         return;
@@ -2175,9 +2091,9 @@
 
       var endpoint = { approve: "approve", reject: "reject", request_edits: "request-edits", unpublish: "unpublish" }[action];
       if (!endpoint) return;
-      var prompt = action === "reject" ? "Reject this accessible version? Students will not see it."
-                 : action === "request_edits" ? "Pull this back to draft for more edits?"
-                 : action === "unpublish" ? "Unpublish this accessible version? Students will no longer see it and its Canvas page will be unpublished. You can re-publish it anytime."
+      var prompt = action === "reject" ? "Reject this accessible version? Students won\u2019t see it."
+                 : action === "request_edits" ? "Move this back to draft? Students won\u2019t see the formats until you publish again."
+                 : action === "unpublish" ? "Unpublish this accessible version? Students won\u2019t see it, and its Canvas page is unpublished. You can publish it again at any time."
                  : null;
       if (prompt && !window.confirm(prompt)) return;
       btn.disabled = true; btn.textContent = "Working…";
@@ -2236,7 +2152,7 @@
                 window.alert("Action failed: HTTP " + rr.status + ": " + t2.slice(0, 200));
                 return;
               }
-              _showApprovalSuccess(bar, "approve");
+              _showApprovalSuccess(bar, "approve", payload);
             });
             return;
           }
@@ -2246,13 +2162,13 @@
           var txt = await r.text();
           throw new Error("HTTP " + r.status + ": " + txt.slice(0, 200));
         }
-        _showApprovalSuccess(bar, action);
+        _showApprovalSuccess(bar, action, payload);
       } catch (err) {
         btn.disabled = false;
-        btn.textContent = action === "approve" ? "✓ Approve & publish"
-                        : action === "reject"  ? "✕ Reject"
-                        : action === "unpublish" ? "⊘ Unpublish"
-                                               : "↺ Request edits";
+        btn.textContent = action === "approve" ? "Publish"
+                        : action === "reject"  ? "Reject"
+                        : action === "unpublish" ? "Unpublish"
+                                               : "Move back to draft";
         window.alert("Action failed: " + (err && err.message ? err.message : err));
       }
     });
@@ -2280,9 +2196,9 @@
     ov.setAttribute("aria-label", "Choose a translation language");
     ov.innerHTML =
       '<div class="reflow-pn-lang-card">' +
-      '  <header><h2>Translate to…</h2>' +
+      '  <div class="reflow-pn-lang-head"><h2>Translate to…</h2>' +
       '    <button class="reflow-pn-lang-close" type="button" aria-label="Close">&times;</button>' +
-      '  </header>' +
+      '  </div>' +
       '  <ul class="reflow-pn-lang-list"></ul>' +
       '  <div class="reflow-pn-lang-custom">' +
       '    <label>Other language' +

@@ -60,6 +60,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do. Documents approved before the upgrade get their tagged PDF the first
   time someone asks.
 
+### Changed: the menu reports both checks in words
+
+- **The original PDF's veraPDF audit is no longer a percentage.** The
+  number was the share of PDF/UA-1 rules the file passed, and an untagged
+  PDF passes most rules because there is nothing for them to check: the
+  course's test document, with 70 untagged pieces of content (56 runs of
+  text, 13 drawings, an image), no language and 4 fonts not embedded,
+  scored 93%. The menu now says whether the file is tagged at all ("Not
+  tagged: screen readers get no headings, lists or reading order from
+  it"), lists what is wrong with how much of it, and keeps every rule
+  veraPDF cites, with its own wording, a click away
+  (`connector/canvas/accessibility_summary.py`). The score payload adds
+  `original`, `checks`, `file_name` and `edited`; `source_score` stays
+  for API callers.
+- **The accessible version's checks are listed the same way**: problems to
+  fix, things to improve, and things the checks can't judge (an image
+  marked decorative) to confirm by eye, with the score as a note.
+- **The dial speaks for the accessible version.** A number beside the
+  original file's link read as that file's score. Instructors now see a
+  check when the document is published and passes the automated checks,
+  the accessible version's score only when something needs fixing, and
+  "!" for a draft or a conversion that needs attention. A check is a full
+  ring; the stray dot a zero-length arc drew is gone.
+- **The menu is one dialog in three parts**: where the document stands,
+  with its actions; the two checks side by side; and the formats, grouped
+  as "Read online" and "Download", each with what it is for and whether it
+  opens a tab or downloads. Students get "Open the accessible version"
+  first. The dialog is titled with the file's name, keeps its header and
+  footer in view while the middle scrolls, and stacks on a phone.
+- **"Request edits" is folded into Unpublish.** Both took a published
+  document back to draft; Unpublish also takes the Canvas page down, and
+  Edit works on a published document.
+
+### Fixed: what the overlay showed students
+
+- **Students saw "Needs your review. Click to approve" on drafts.** The
+  overlay gave students a dial for any document with a score, and the dial
+  spoke to instructors. Students now get a dial only once a document is
+  published, which is when they can open the formats.
+- **A link to a file Iris never converted got an empty menu.** Images and
+  other files linked from a page got a "—" dial that opened a menu with
+  nothing in it; files Iris doesn't know have no dial now.
+- **The menu's header and footer were landmarks.** As `<header>` and
+  `<footer>` at the top of the page they added a second banner and
+  contentinfo beside Canvas's own (axe: landmark-no-duplicate-banner); so
+  did the editor and the language picker. They are plain containers now,
+  and they restate their own box, so a theme's styles for header elements
+  can't reach them.
+- **"Download Braille (BRF) (BRF)"**: a download's accessible name no
+  longer repeats a type its label already gives.
+- **The editor's "Edited by faculty" mark** shows wherever the menu opens,
+  not only on the Files page.
+
 ### Fixed: the Alternative Formats Menu
 
 - **Three formats left the menu.** HTML with math: Accessible HTML now

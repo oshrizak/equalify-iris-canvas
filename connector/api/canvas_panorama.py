@@ -21,6 +21,10 @@ from fastapi.responses import (
 from pydantic import BaseModel
 from redis.asyncio import Redis
 
+from ..canvas.accessibility_summary import (
+    accessible_version_summary,
+    original_pdf_summary,
+)
 from ..canvas.alt_formats import (
     audio_configured,
     html_full_document,
@@ -167,7 +171,6 @@ async def scored_files(
         payload = await _build_score_payload(redis, job_id)
         payload["job_id"] = job_id
         payload["canvas_file_id"] = best.get("canvas_file_id")
-        payload["edited"] = bool(await get_edited_html(redis, job_id))
         out[filename] = payload
     return JSONResponse({"course_id": course_id, "by_filename": out})
 
@@ -181,10 +184,8 @@ async def score_by_job(
 
     The overlay uses this to decorate the *accessible-version* link in a
     published Canvas Page (``/canvas/panorama/alt/{job_id}/html``). Unlike
-    ``/score`` — which resolves a Canvas *file* id to a job and shows the
-    original PDF's source estimate — this returns the job directly so the
-    accessible link can show the WCAG accessibility of the generated output
-    (the "after" number).
+    ``/score``, which resolves a Canvas *file* id to a job, this takes the
+    job directly. The payload is the same.
     """
     ids = [j.strip() for j in job_ids.split(",") if j.strip()]
     if len(ids) > 50:
@@ -768,9 +769,10 @@ async def _connector_pdf(redis: Redis, job: Any, request: Request, *, edited: bo
 async def _build_score_payload(redis: Redis, job_id: str) -> dict[str, Any]:
     """Compute or read cached score + available formats for a job."""
     cached = await redis.get(SCORE_CACHE_KEY.format(job_id=job_id))
-    if cached:
-        payload = json.loads(cached)
-    else:
+    payload = json.loads(cached) if cached else None
+    if payload is not None and payload.get("status") == "scored" and "checks" not in payload:
+        payload = None  # cached before the menu listed what the checks found
+    if payload is None:
         try:
             s = await _compute_score(job_id, redis=redis)
             payload = asdict(s)
@@ -811,10 +813,10 @@ async def _build_score_payload(redis: Redis, job_id: str) -> dict[str, Any]:
     job = await get_job(redis, job_id)
     if job is not None:
         payload["job_status"] = job.status
-        # Before→after story. ``score`` (above) is the WCAG accessibility of
-        # the generated accessible version — the "after". Here we attach the
-        # ORIGINAL PDF's accessibility — the "before" — so the dial can show
-        # the lift the conversion gave.
+        # ``score`` (above) is the accessible version's result on the
+        # automated checks: what students get, and what the dial reflects.
+        # Here we attach the ORIGINAL file's own result, which the menu
+        # reports beside it.
         #
         # Prefer the real PDF/UA audit ``CanvasJob.verapdf_score`` produced
         # by ``canvas.verapdf_audit`` at submission time when one is
@@ -822,7 +824,12 @@ async def _build_score_payload(redis: Redis, job_id: str) -> dict[str, Any]:
         # signals only when the audit was skipped (non-PDF source, verapdf
         # binary missing, audit timeout). The heuristic is honest about
         # being a triage signal, not a WCAG conformance proof — see the
-        # docstring in ``canvas.signals``.
+        # docstring in ``canvas.signals``. Neither number is shown in the
+        # menu any more; ``source_score`` stays for API callers.
+        payload["file_name"] = job.canvas_file_name
+        # Every surface that opens the menu says when faculty edited the
+        # accessible version, not just the Files page.
+        payload["edited"] = bool(await get_edited_html(redis, job_id))
         verapdf_score = getattr(job, "verapdf_score", None)
         if verapdf_score is not None:
             from ..canvas.panorama import severity_of as _severity_of
@@ -835,6 +842,13 @@ async def _build_score_payload(redis: Redis, job_id: str) -> dict[str, Any]:
             violations = getattr(job, "verapdf_violations", None) or []
             payload["verapdf_violations"] = list(violations)
             payload["verapdf_audited_at"] = getattr(job, "verapdf_audited_at", None)
+            # The menu reports the original in words: whether it is tagged
+            # at all, and what is wrong with how much of it. The percentage
+            # above (rules passed) stays for API callers; the menu no longer
+            # shows it, because an untagged file passes most rules vacuously.
+            payload["original"] = original_pdf_summary(
+                list(violations), getattr(job, "verapdf_is_compliant", None),
+            )
         else:
             src_score, src_sev = source_accessibility_estimate(getattr(job, "signals", None))
             if src_score is not None:
@@ -1035,7 +1049,8 @@ async def _compute_score(job_id: str, redis: Redis | None = None) -> Score:
         report = run_wcag_checks(html_full_document(rendered, mathjax=False))
         score = _accessibility_score_from_wcag(report)
         return Score(score=score, severity=severity_of(score),
-                     available_formats=list(LIVE_FORMATS), status="scored")
+                     available_formats=list(LIVE_FORMATS), status="scored",
+                     checks=accessible_version_summary(report.findings))
     except ContentUnavailableError as exc:
         logger.debug("No score yet for %s: %s", job_id, exc)
     except HTTPException as exc:
